@@ -21,12 +21,12 @@ class _DetailDialog(QDialog):
         v = QVBoxLayout(self)
 
         h = QLabel(title)
-        h.setObjectName("sectionhead")
+        h.setStyleSheet("font-size: 16px; font-weight: bold; color: #1F4E79; padding: 4px 0;")
         v.addWidget(h)
 
         if not rows:
             empty = QLabel(empty_msg)
-            empty.setObjectName("emptystate")
+            empty.setStyleSheet("color: #6B7B8C; padding: 20px;")
             empty.setAlignment(Qt.AlignCenter)
             v.addWidget(empty)
         else:
@@ -66,11 +66,11 @@ class DashboardView(QWidget):
         # Header
         header = QHBoxLayout()
         title = QLabel("Dashboard")
-        title.setObjectName("pagetitle")
+        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #1F4E79;")
         header.addWidget(title)
         header.addStretch()
         hint = QLabel("Tip: click any card below to see today's details")
-        hint.setObjectName("hintmedium")
+        hint.setStyleSheet("color: #6B7B8C; font-size: 12px;")
         header.addWidget(hint)
         refresh = QPushButton("⟳ Refresh")
         refresh.setObjectName("secondary")
@@ -80,27 +80,24 @@ class DashboardView(QWidget):
 
         # Top stat cards — all clickable
         self.card_revenue  = StatCard("Revenue Today",   "0.00", "ETB",    clickable=True)
-        self.card_profit   = StatCard("Profit Today",    "0.00", "ETB",    clickable=True)
         self.card_sales    = StatCard("Sales Today",     "0",    "items",  clickable=True)
         self.card_prod     = StatCard("Production Today","0",    "items",  clickable=True)
         self.card_lowstock = StatCard("Low Stock Alerts","0",    "materials", clickable=True)
 
         self.card_revenue.clicked.connect(self._show_today_sales)
-        self.card_profit.clicked.connect(self._show_profit_breakdown)
         self.card_sales.clicked.connect(self._show_today_sales)
         self.card_prod.clicked.connect(self._show_today_production)
         self.card_lowstock.clicked.connect(self._show_low_stock)
 
         row = QHBoxLayout()
         row.setSpacing(12)
-        for c in (self.card_revenue, self.card_profit, self.card_sales,
-                  self.card_prod, self.card_lowstock):
+        for c in (self.card_revenue, self.card_sales, self.card_prod, self.card_lowstock):
             row.addWidget(c)
         outer.addLayout(row)
 
-        # Material stock cards (compact display, not clickable)
+        # Material stock cards (also clickable -> low-stock popup for the same material)
         mats_label = QLabel("Raw Materials")
-        mats_label.setObjectName("sectionhead")
+        mats_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #1F4E79; margin-top: 6px;")
         outer.addWidget(mats_label)
 
         self.materials_grid = QGridLayout()
@@ -110,7 +107,7 @@ class DashboardView(QWidget):
 
         # Low stock summary table
         bottom_label_low = QLabel("Low-Stock Alerts")
-        bottom_label_low.setObjectName("dangerhead")
+        bottom_label_low.setStyleSheet("font-size: 16px; font-weight: bold; color: #C0392B; margin-top: 6px;")
         outer.addWidget(bottom_label_low)
         self.low_table = QTableWidget(0, 4)
         self.low_table.setHorizontalHeaderLabels(["Material", "Current Stock", "Threshold", "Unit"])
@@ -127,8 +124,6 @@ class DashboardView(QWidget):
         data = report_service.dashboard_summary()
 
         self.card_revenue.set_value(f"{data['sales_today_revenue']:,.2f}", "ETB")
-        profit = data.get('sales_today_profit', 0)
-        self.card_profit.set_value(f"{profit:,.2f}", "ETB", alert=(profit < 0))
         self.card_sales.set_value(f"{data['sales_today_qty']:,.0f}", "items sold")
         self.card_prod.set_value(f"{data['production_today_qty']:,.0f}", "items produced")
         self.card_lowstock.set_value(str(len(data["low_stock"])), "materials",
@@ -208,35 +203,5 @@ class DashboardView(QWidget):
             ["Material","Current Stock","Threshold","Unit"],
             data, parent=self,
             empty_msg="All materials are above their thresholds. 👍"
-        )
-        dlg.exec_()
-
-    def _show_profit_breakdown(self):
-        from app.utils import clock
-        today = clock.today()
-        rows = report_service.profit_by_product(today, today)
-        data = []
-        for r in rows:
-            unit = "pieces" if r["input_unit"] == "piece" else "m²"
-            data.append([
-                r["category"], r["code"], r["name"],
-                f"{r['qty_sold']:.2f} {unit}",
-                f"{r['revenue']:,.2f}",
-                f"{r['cost']:,.2f}",
-                f"{r['profit']:,.2f}",
-            ])
-        ps = report_service.profit_summary(today, today)
-        # Footer row
-        data.append([
-            "TOTAL", "", "", "",
-            f"{ps['revenue']:,.2f}",
-            f"{ps['cost_of_sales']:,.2f}",
-            f"{ps['gross_profit']:,.2f}",
-        ])
-        dlg = _DetailDialog(
-            f"Today's Profit Breakdown — Gross: {ps['gross_profit']:,.2f} ETB",
-            ["Category","Code","Product","Sold","Revenue","Cost","Profit"],
-            data, parent=self,
-            empty_msg="No sales recorded today yet."
         )
         dlg.exec_()

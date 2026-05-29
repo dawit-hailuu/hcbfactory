@@ -36,8 +36,6 @@ class BulkProductionView(QWidget):
                 cb.blockSignals(False)
                 self._update_unit(r)
             # Refresh made_by completer too
-            from PyQt5.QtCore import Qt
-            from PyQt5.QtWidgets import QCompleter
             names = production_service.recent_made_by(limit=10)
             c = QCompleter(names, self.made_by)
             c.setCaseSensitivity(Qt.CaseInsensitive)
@@ -156,9 +154,6 @@ class BulkProductionView(QWidget):
             QMessageBox.warning(self, "Nothing to submit", "Add at least one row with quantity > 0.")
             return
 
-        # First pass: pre-check material sufficiency across the whole batch
-        # (Each call individually checks, but multiple lines sharing materials
-        #  could compound — we run them sequentially and let the service stop us.)
         confirm = QMessageBox.question(
             self, "Confirm bulk production",
             f"Record {len(entries)} production line(s)?",

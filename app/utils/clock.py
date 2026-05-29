@@ -1,15 +1,10 @@
 """Local-time helper. All record timestamps go through here."""
-from datetime import datetime, date
+from datetime import datetime
 
 
 def today() -> str:
     """YYYY-MM-DD in local time. Used for production_date, sale_date, etc."""
     return datetime.now().strftime("%Y-%m-%d")
-
-
-def today_date() -> date:
-    """Local date as a datetime.date object."""
-    return datetime.now().date()
 
 
 def now() -> str:

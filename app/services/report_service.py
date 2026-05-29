@@ -1,8 +1,7 @@
 """
 Reports service.
-
-Aggregations for dashboard + daily/weekly/monthly reports.
-PDF export via reportlab.
+Aggregations for dashboard, PDF export (reportlab), and tabular reports
+powered by the double-entry transaction ledgers.
 """
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -14,15 +13,20 @@ def todays_sales():
     conn = get_connection()
     try:
         today = conn.execute("SELECT date('now','localtime') AS d").fetchone()["d"]
-        rows = conn.execute(
-            """SELECT s.sale_date, s.customer_name, s.quantity, s.unit_price, s.total,
-                      pr.code, pr.name, pr.input_unit
-                 FROM sales s
-                 JOIN products pr ON pr.id = s.product_id
-                WHERE s.sale_date = ?
-                ORDER BY s.id DESC""",
-            (today,)
-        ).fetchall()
+        sql = """
+            SELECT date(v.created_at) AS sale_date, v.customer_name, 
+                   ABS(il.qty_change) AS quantity, (je.debit / ABS(il.qty_change)) AS unit_price,
+                   je.debit AS total, a.code, a.name, a.unit AS input_unit
+            FROM vouchers v
+            JOIN inventory_ledger il ON il.voucher_id = v.id AND il.qty_change < 0
+            JOIN articles a ON a.id = il.article_id
+            JOIN journal_entries je ON je.voucher_id = v.id AND je.debit > 0
+            WHERE v.voucher_type IN ('CASH_SALE', 'CREDIT_SALE')
+              AND v.state = 'POSTED'
+              AND date(v.created_at) = ?
+            ORDER BY v.id DESC
+        """
+        rows = conn.execute(sql, (today,)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -33,15 +37,18 @@ def todays_production():
     conn = get_connection()
     try:
         today = conn.execute("SELECT date('now','localtime') AS d").fetchone()["d"]
-        rows = conn.execute(
-            """SELECT p.production_date, p.quantity, p.made_by, p.note,
-                      pr.code, pr.name, pr.input_unit
-                 FROM production p
-                 JOIN products pr ON pr.id = p.product_id
-                WHERE p.production_date = ?
-                ORDER BY p.id DESC""",
-            (today,)
-        ).fetchall()
+        sql = """
+            SELECT date(v.created_at) AS production_date, il.qty_change AS quantity,
+                   v.made_by, v.note, a.code, a.name, a.unit AS input_unit
+            FROM vouchers v
+            JOIN inventory_ledger il ON il.voucher_id = v.id AND il.qty_change > 0
+            JOIN articles a ON a.id = il.article_id
+            WHERE v.voucher_type = 'PRODUCTION'
+              AND v.state = 'POSTED'
+              AND date(v.created_at) = ?
+            ORDER BY v.id DESC
+        """
+        rows = conn.execute(sql, (today,)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -53,34 +60,53 @@ def dashboard_summary():
     try:
         today = conn.execute("SELECT date('now','localtime') AS d").fetchone()["d"]
 
-        sales_today = conn.execute(
-            """SELECT COALESCE(SUM(quantity),0) AS qty,
-                      COALESCE(SUM(total),0)    AS revenue,
-                      COALESCE(SUM(cost_total),0) AS cost
-               FROM sales WHERE sale_date = ? AND deleted_at IS NULL""", (today,)
-        ).fetchone()
+        # Today's sales totals
+        sales_sql = """
+            SELECT COALESCE(SUM(ABS(il.qty_change)), 0) AS qty, 
+                   COALESCE(SUM(je.debit), 0) AS revenue
+            FROM vouchers v
+            JOIN inventory_ledger il ON il.voucher_id = v.id AND il.qty_change < 0
+            JOIN journal_entries je ON je.voucher_id = v.id AND je.debit > 0
+            WHERE v.voucher_type IN ('CASH_SALE', 'CREDIT_SALE')
+              AND v.state = 'POSTED'
+              AND date(v.created_at) = ?
+        """
+        sales_today = conn.execute(sales_sql, (today,)).fetchone()
 
-        prod_today = conn.execute(
-            """SELECT COALESCE(SUM(quantity),0) AS qty
-               FROM production WHERE production_date = ? AND deleted_at IS NULL""", (today,)
-        ).fetchone()
+        # Today's production totals
+        prod_sql = """
+            SELECT COALESCE(SUM(il.qty_change), 0) AS qty
+            FROM vouchers v
+            JOIN inventory_ledger il ON il.voucher_id = v.id AND il.qty_change > 0
+            WHERE v.voucher_type = 'PRODUCTION'
+              AND v.state = 'POSTED'
+              AND date(v.created_at) = ?
+        """
+        prod_today = conn.execute(prod_sql, (today,)).fetchone()
 
-        materials = [dict(r) for r in conn.execute(
-            "SELECT * FROM materials ORDER BY name"
-        ).fetchall()]
-
+        # Materials list (RAW Category)
+        materials_sql = """
+            SELECT id, code, name, unit, warehouse_qty AS current_stock, low_stock_alert, cost_price AS unit_cost
+            FROM articles
+            WHERE category = 'RAW' AND is_active = True
+            ORDER BY name
+        """
+        materials = [dict(r) for r in conn.execute(materials_sql).fetchall()]
         low_stock = [m for m in materials if m["current_stock"] <= m["low_stock_alert"]]
 
-        finished = [dict(r) for r in conn.execute(
-            "SELECT * FROM products WHERE stock > 0 ORDER BY category, code"
-        ).fetchall()]
+        # Finished goods list
+        finished_sql = """
+            SELECT id, code, name, category, unit AS input_unit, shop_floor_qty AS stock, sell_price, low_stock_alert
+            FROM articles
+            WHERE category != 'RAW' AND shop_floor_qty > 0 AND is_active = True
+            ORDER BY category, code
+        """
+        finished = [dict(r) for r in conn.execute(finished_sql).fetchall()]
 
         return {
             "date": today,
             "sales_today_qty": sales_today["qty"],
             "sales_today_revenue": sales_today["revenue"],
-            "sales_today_cost": sales_today["cost"],
-            "sales_today_profit": sales_today["revenue"] - sales_today["cost"],
             "production_today_qty": prod_today["qty"],
             "materials": materials,
             "low_stock": low_stock,
@@ -91,29 +117,32 @@ def dashboard_summary():
 
 
 def production_report(date_from: str, date_to: str, category: str = None):
-    """Detailed production rows grouped by (date, product, made_by).
-    Filter by category ('HCB'/'TERAZO'/'PIPE') if given.
-    Returns one row per (date, product, made_by) combination — readable in a table.
-    """
+    """Detailed production rows grouped by (date, product, made_by)."""
     conn = get_connection()
     try:
-        where = ["p.production_date BETWEEN ? AND ?"]
+        where = [
+            "v.voucher_type = 'PRODUCTION'",
+            "v.state = 'POSTED'",
+            "date(v.created_at) BETWEEN ? AND ?"
+        ]
         params = [date_from, date_to]
         if category:
-            where.append("pr.category = ?")
+            where.append("a.category = ?")
             params.append(category)
+            
         sql = f"""
-            SELECT p.production_date,
-                   pr.code, pr.name, pr.input_unit, pr.category,
-                   COALESCE(p.made_by, '') AS made_by,
-                   SUM(p.quantity) AS total_qty,
-                   COUNT(*) AS runs,
-                   GROUP_CONCAT(NULLIF(p.note, ''), ' | ') AS notes
-            FROM production p
-            JOIN products pr ON pr.id = p.product_id
+            SELECT date(v.created_at) AS production_date,
+                   a.code, a.name, a.unit AS input_unit, a.category,
+                   COALESCE(v.made_by, '') AS made_by,
+                   SUM(il.qty_change) AS total_qty,
+                   COUNT(DISTINCT v.id) AS runs,
+                   GROUP_CONCAT(NULLIF(v.note, ''), ' | ') AS notes
+            FROM vouchers v
+            JOIN inventory_ledger il ON il.voucher_id = v.id AND il.qty_change > 0
+            JOIN articles a ON a.id = il.article_id
             WHERE {' AND '.join(where)}
-            GROUP BY p.production_date, pr.code, pr.name, pr.input_unit, pr.category, made_by
-            ORDER BY p.production_date DESC, pr.code
+            GROUP BY date(v.created_at), a.code, a.name, a.unit, a.category, v.made_by
+            ORDER BY date(v.created_at) DESC, a.code
         """
         rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
@@ -122,62 +151,71 @@ def production_report(date_from: str, date_to: str, category: str = None):
 
 
 def material_usage_report(date_from: str, date_to: str):
-    """Detailed material report with opening stock, used, purchased, and remaining.
-
-    For each material:
-      - current_stock      = right now (from materials table)
-      - total_used         = sum of |qty| from stock_movements where movement='production'
-                             AND created_at falls within [date_from, date_to+1)
-      - purchased          = sum of qty (positive) from stock_movements where
-                             movement='purchase' AND created_at in range
-      - opening_stock      = current_stock + total_used - purchased + adjustments_in_period
-                             (i.e. work backwards from now)
+    """
+    Detailed material report with opening stock, used, purchased, and remaining.
+    Opening stock is calculated by summing all history prior to the range start.
     """
     conn = get_connection()
     try:
-        # End of day = date_to + ' 23:59:59' for inclusive range
-        rng_lo = f"{date_from} 00:00:00"
-        rng_hi = f"{date_to} 23:59:59"
-
-        rows = conn.execute(
-            """SELECT id, code, name, unit, current_stock
-                 FROM materials ORDER BY name"""
+        # Load all active raw materials
+        materials = conn.execute(
+            """SELECT id, code, name, unit, warehouse_qty AS current_stock 
+               FROM articles WHERE category = 'RAW' AND is_active = True 
+               ORDER BY name"""
         ).fetchall()
 
         out = []
-        for m in rows:
-            used_row = conn.execute(
-                """SELECT COALESCE(SUM(qty), 0) AS s
-                   FROM stock_movements
-                   WHERE material_id = ?
-                     AND movement = 'production'
-                     AND created_at BETWEEN ? AND ?""",
-                (m["id"], rng_lo, rng_hi),
-            ).fetchone()
-            total_used = abs(used_row["s"])
+        for m in materials:
+            # 1. Opening Stock: Sum all posted qty changes before date_from
+            op_sql = """
+                SELECT COALESCE(SUM(il.qty_change), 0) AS opening
+                FROM inventory_ledger il
+                JOIN vouchers v ON v.id = il.voucher_id
+                WHERE il.article_id = ?
+                  AND il.location = 'WAREHOUSE'
+                  AND v.state = 'POSTED'
+                  AND date(v.created_at) < ?
+            """
+            opening_stock = conn.execute(op_sql, (m["id"], date_from)).fetchone()["opening"]
 
-            purchased_row = conn.execute(
-                """SELECT COALESCE(SUM(qty), 0) AS s
-                   FROM stock_movements
-                   WHERE material_id = ?
-                     AND movement = 'purchase'
-                     AND created_at BETWEEN ? AND ?""",
-                (m["id"], rng_lo, rng_hi),
-            ).fetchone()
-            purchased = purchased_row["s"]
+            # 2. Used in period (negative quantity changes during production runs)
+            used_sql = """
+                SELECT COALESCE(SUM(il.qty_change), 0) AS consumed
+                FROM inventory_ledger il
+                JOIN vouchers v ON v.id = il.voucher_id
+                WHERE il.article_id = ?
+                  AND il.location = 'WAREHOUSE'
+                  AND v.voucher_type = 'PRODUCTION'
+                  AND v.state = 'POSTED'
+                  AND date(v.created_at) BETWEEN ? AND ?
+            """
+            total_used = abs(conn.execute(used_sql, (m["id"], date_from, date_to)).fetchone()["consumed"])
 
-            # Net change in period from ANY movement type (incl. adjustments)
-            net_row = conn.execute(
-                """SELECT COALESCE(SUM(qty), 0) AS s
-                   FROM stock_movements
-                   WHERE material_id = ?
-                     AND created_at BETWEEN ? AND ?""",
-                (m["id"], rng_lo, rng_hi),
-            ).fetchone()
-            net_change = net_row["s"]
+            # 3. Purchased in period (positive qty changes in SRV)
+            pur_sql = """
+                SELECT COALESCE(SUM(il.qty_change), 0) AS purchased
+                FROM inventory_ledger il
+                JOIN vouchers v ON v.id = il.voucher_id
+                WHERE il.article_id = ?
+                  AND il.location = 'WAREHOUSE'
+                  AND v.voucher_type = 'SRV'
+                  AND v.state = 'POSTED'
+                  AND date(v.created_at) BETWEEN ? AND ?
+            """
+            purchased = conn.execute(pur_sql, (m["id"], date_from, date_to)).fetchone()["purchased"]
 
-            # Working backwards: opening = current - net_change_during_period
-            opening_stock = m["current_stock"] - net_change
+            # 4. Total net change in period (all movements, including adjustments)
+            net_sql = """
+                SELECT COALESCE(SUM(il.qty_change), 0) AS net
+                FROM inventory_ledger il
+                JOIN vouchers v ON v.id = il.voucher_id
+                WHERE il.article_id = ?
+                  AND il.location = 'WAREHOUSE'
+                  AND v.state = 'POSTED'
+                  AND date(v.created_at) BETWEEN ? AND ?
+            """
+            net_change = conn.execute(net_sql, (m["id"], date_from, date_to)).fetchone()["net"]
+            remaining = opening_stock + net_change
 
             out.append({
                 "code":          m["code"],
@@ -186,7 +224,7 @@ def material_usage_report(date_from: str, date_to: str):
                 "opening_stock": opening_stock,
                 "total_used":    total_used,
                 "purchased":     purchased,
-                "remaining":     m["current_stock"],
+                "remaining":     remaining,
             })
         return out
     finally:
@@ -195,28 +233,33 @@ def material_usage_report(date_from: str, date_to: str):
 
 def sales_report(date_from: str, date_to: str, category: str = None,
                  customer: str = None):
-    """Detailed per-sale rows. Each sale is its own line so reports show
-    date / customer / product / qty / unit price / total.
-    """
+    """Detailed sales rows in double-entry structure."""
     conn = get_connection()
     try:
-        where = ["s.sale_date BETWEEN ? AND ?"]
+        where = [
+            "v.voucher_type IN ('CASH_SALE', 'CREDIT_SALE')",
+            "v.state = 'POSTED'",
+            "date(v.created_at) BETWEEN ? AND ?"
+        ]
         params = [date_from, date_to]
         if category:
-            where.append("pr.category = ?")
+            where.append("a.category = ?")
             params.append(category)
         if customer:
-            where.append("LOWER(COALESCE(s.customer_name,'')) = LOWER(?)")
+            where.append("LOWER(COALESCE(v.customer_name,'')) = LOWER(?)")
             params.append(customer)
+            
         sql = f"""
-            SELECT s.id, s.sale_date, pr.code, pr.name, pr.input_unit, pr.category,
-                   COALESCE(s.customer_name, '') AS customer_name,
-                   s.quantity, s.unit_price, s.total,
-                   COALESCE(s.note, '') AS note
-            FROM sales s
-            JOIN products pr ON pr.id = s.product_id
+            SELECT v.id, date(v.created_at) AS sale_date, a.code, a.name, a.unit AS input_unit, a.category,
+                   COALESCE(v.customer_name, '') AS customer_name,
+                   ABS(il.qty_change) AS quantity, (je.debit / ABS(il.qty_change)) AS unit_price,
+                   je.debit AS total, COALESCE(v.note, '') AS note
+            FROM vouchers v
+            JOIN inventory_ledger il ON il.voucher_id = v.id AND il.qty_change < 0
+            JOIN articles a ON a.id = il.article_id
+            JOIN journal_entries je ON je.voucher_id = v.id AND je.debit > 0
             WHERE {' AND '.join(where)}
-            ORDER BY s.sale_date DESC, s.id DESC
+            ORDER BY date(v.created_at) DESC, v.id DESC
         """
         rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
@@ -225,46 +268,63 @@ def sales_report(date_from: str, date_to: str, category: str = None,
 
 
 def finished_goods_report(date_from: str, date_to: str):
-    """Per-product report: produced in period, sold in period, current stock.
-    Splits naturally by category, since each product carries its own category.
-    """
+    """Per-product report: produced in period, sold in period, current stock."""
     conn = get_connection()
     try:
-        rows = conn.execute(
-            """
-            SELECT pr.code, pr.name, pr.category, pr.input_unit, pr.stock AS current_stock,
-                   COALESCE((SELECT SUM(p.quantity) FROM production p
-                              WHERE p.product_id = pr.id
-                                AND p.production_date BETWEEN ? AND ?), 0) AS produced,
-                   COALESCE((SELECT SUM(s.quantity) FROM sales s
-                              WHERE s.product_id = pr.id
-                                AND s.sale_date BETWEEN ? AND ?), 0) AS sold
-            FROM products pr
-            ORDER BY pr.category, pr.code
-            """,
-            (date_from, date_to, date_from, date_to),
-        ).fetchall()
+        sql = """
+            SELECT a.code, a.name, a.category, a.unit AS input_unit, 
+                   (COALESCE(a.warehouse_qty, 0) + COALESCE(a.shop_floor_qty, 0)) AS current_stock,
+                   COALESCE((
+                       SELECT SUM(il.qty_change) 
+                       FROM inventory_ledger il
+                       JOIN vouchers v ON v.id = il.voucher_id
+                       WHERE il.article_id = a.id
+                         AND il.location = 'WAREHOUSE'
+                         AND il.qty_change > 0
+                         AND v.voucher_type = 'PRODUCTION'
+                         AND v.state = 'POSTED'
+                         AND date(v.created_at) BETWEEN ? AND ?
+                   ), 0.0) AS produced,
+                   COALESCE((
+                       SELECT SUM(ABS(il.qty_change)) 
+                       FROM inventory_ledger il
+                       JOIN vouchers v ON v.id = il.voucher_id
+                       WHERE il.article_id = a.id
+                         AND il.location = 'SHOP_FLOOR'
+                         AND il.qty_change < 0
+                         AND v.voucher_type IN ('CASH_SALE', 'CREDIT_SALE')
+                         AND v.state = 'POSTED'
+                         AND date(v.created_at) BETWEEN ? AND ?
+                   ), 0.0) AS sold
+            FROM articles a
+            WHERE a.category != 'RAW' AND a.is_active = True
+            ORDER BY a.category, a.code
+        """
+        rows = conn.execute(sql, (date_from, date_to, date_from, date_to)).fetchall()
+
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
 def distinct_customers():
-    """Return a sorted list of distinct customer names ever used (case-preserving)."""
+    """Sorted list of distinct customer names ever used in sales vouchers."""
     conn = get_connection()
     try:
-        rows = conn.execute(
-            """SELECT DISTINCT customer_name FROM sales
-               WHERE customer_name IS NOT NULL AND TRIM(customer_name) != ''
-               ORDER BY LOWER(customer_name)"""
-        ).fetchall()
+        sql = """
+            SELECT DISTINCT customer_name FROM vouchers
+            WHERE customer_name IS NOT NULL 
+              AND TRIM(customer_name) != '' 
+              AND voucher_type IN ('CASH_SALE', 'CREDIT_SALE')
+            ORDER BY LOWER(customer_name)
+        """
+        rows = conn.execute(sql).fetchall()
         return [r["customer_name"] for r in rows]
     finally:
         conn.close()
 
 
 def date_range_for(period: str):
-    """period in {'today','week','month','year'} -> (date_from, date_to)."""
     today = datetime.now().date()
     if period == "today":
         return today.isoformat(), today.isoformat()
@@ -280,19 +340,11 @@ def date_range_for(period: str):
     raise ValueError(f"unknown period {period}")
 
 
-# ---------------------------------------------------------------------------
 # PDF export — uses reportlab
-# ---------------------------------------------------------------------------
-
-# Amharic font registration is attempted once. If no Ethiopic-capable font
-# is found, Amharic characters fall back to the product CODE rather than
-# the localized name (so the PDF never crashes or shows tofu boxes).
-_FONT_REGISTERED = None  # (regular_name, bold_name) or False
+_FONT_REGISTERED = None
 
 
 def _register_amharic_font():
-    """Try to register an Ethiopic-capable Unicode font with reportlab.
-    Returns a tuple (regular, bold) of font names, or False if not available."""
     global _FONT_REGISTERED
     if _FONT_REGISTERED is not None:
         return _FONT_REGISTERED
@@ -301,7 +353,6 @@ def _register_amharic_font():
     from reportlab.pdfbase.ttfonts import TTFont
     import os
 
-    # Common locations for Ethiopic-capable fonts on Windows / Linux / Mac
     candidates = [
         ("AbyssinicaSIL", "C:\\Windows\\Fonts\\AbyssinicaSIL-R.ttf", None),
         ("Nyala",         "C:\\Windows\\Fonts\\nyala.ttf",            None),
@@ -318,7 +369,7 @@ def _register_amharic_font():
                 if bold and os.path.exists(bold):
                     pdfmetrics.registerFont(TTFont(bold_name, bold))
                 else:
-                    bold_name = name  # use regular as bold fallback
+                    bold_name = name
                 _FONT_REGISTERED = (name, bold_name)
                 return _FONT_REGISTERED
         except Exception:
@@ -329,11 +380,8 @@ def _register_amharic_font():
 
 
 def _amharic_safe(text: str, fallback: str) -> str:
-    """If we don't have an Ethiopic font, replace any Ethiopic character
-    string with the provided fallback (typically a product code)."""
     if _register_amharic_font():
         return text
-    # Detect any Ethiopic codepoint (U+1200..U+137F)
     if any('\u1200' <= ch <= '\u137F' for ch in (text or "")):
         return fallback
     return text
@@ -341,17 +389,12 @@ def _amharic_safe(text: str, fallback: str) -> str:
 
 def export_pdf(report_type: str, date_from: str, date_to: str, out_path: str,
                customer: str = None):
-    """
-    report_type: 'production' | 'materials' | 'sales' | 'finished' | 'combined'
-    customer:    if set, restricts the sales section to this customer.
-    Saves a PDF and returns the file path.
-    """
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
-                                    Table, TableStyle, PageBreak)
+                                    Table, TableStyle)
 
     font = _register_amharic_font()
     base_font = font[0] if font else "Helvetica"
@@ -416,7 +459,7 @@ def export_pdf(report_type: str, date_from: str, date_to: str, out_path: str,
         story.append(t)
         story.append(Spacer(1, 6))
 
-    # ---------- Production: split per category ------------------------------
+    # Production Grouped per Category
     if report_type in ("production", "combined"):
         story.append(Paragraph("Production", h2))
         for cat, label in (("HCB","HCB"), ("TERAZO","Terazo"), ("PIPE","Pipes (ቱቦ)")):
@@ -438,7 +481,7 @@ def export_pdf(report_type: str, date_from: str, date_to: str, out_path: str,
                       ["Date","Code","Product","Qty","Unit","Made By","Runs","Notes"],
                       data, totals=totals)
 
-    # ---------- Material Usage ---------------------------------------------
+    # Material Usage
     if report_type in ("materials", "combined"):
         rows = material_usage_report(date_from, date_to)
         data = [[r["code"], r["name"],
@@ -450,7 +493,7 @@ def export_pdf(report_type: str, date_from: str, date_to: str, out_path: str,
         add_table("Material Usage",
                   ["Code","Material","Opening","Used","Purchased","Remaining","Unit"], data)
 
-    # ---------- Sales: split per category ----------------------------------
+    # Sales Grouped per Category
     if report_type in ("sales", "combined"):
         story.append(Paragraph("Sales", h2))
         for cat, label in (("HCB","HCB"), ("TERAZO","Terazo"), ("PIPE","Pipes (ቱቦ)")):
@@ -474,10 +517,9 @@ def export_pdf(report_type: str, date_from: str, date_to: str, out_path: str,
                       ["Date","Code","Product","Customer","Qty","Unit","Unit Price","Total (ETB)","Note"],
                       data, totals=totals)
 
-    # ---------- Finished Goods --------------------------------------------
+    # Finished Goods stock
     if report_type in ("finished", "combined"):
         rows = finished_goods_report(date_from, date_to)
-        # Split by category in PDF too
         story.append(Paragraph("Finished Goods", h2))
         for cat, label in (("HCB","HCB"), ("TERAZO","Terazo"), ("PIPE","Pipes (ቱቦ)")):
             sub = [r for r in rows if r["category"] == cat]
@@ -495,82 +537,25 @@ def export_pdf(report_type: str, date_from: str, date_to: str, out_path: str,
     return out_path
 
 
-# ---------------------------------------------------------------------------
-# v3 reporting: profit, worker performance, expense summary
-# ---------------------------------------------------------------------------
-
-def profit_summary(date_from: str, date_to: str):
-    """Returns gross + net profit numbers over the period.
-    gross_profit = revenue - cost_of_sales
-    net_profit   = gross_profit - total_operating_expenses
-    """
-    from app.services import expense_service
-    conn = get_connection()
-    try:
-        r = conn.execute(
-            """SELECT COALESCE(SUM(total),0)      AS revenue,
-                      COALESCE(SUM(cost_total),0) AS cost
-                FROM sales
-                WHERE sale_date BETWEEN ? AND ?
-                  AND deleted_at IS NULL""",
-            (date_from, date_to),
-        ).fetchone()
-        revenue = r["revenue"] or 0
-        cost = r["cost"] or 0
-        gross = revenue - cost
-        opex = expense_service.total_expenses(date_from, date_to)
-        return {
-            "revenue": revenue,
-            "cost_of_sales": cost,
-            "gross_profit": gross,
-            "operating_expenses": opex,
-            "net_profit": gross - opex,
-            "margin_pct": (gross / revenue * 100) if revenue > 0 else 0,
-        }
-    finally:
-        conn.close()
-
-
-def profit_by_product(date_from: str, date_to: str):
-    """Profit broken down per product for the period."""
-    conn = get_connection()
-    try:
-        rows = conn.execute(
-            """SELECT pr.code, pr.name, pr.category, pr.input_unit,
-                      SUM(s.quantity)   AS qty_sold,
-                      SUM(s.total)      AS revenue,
-                      SUM(s.cost_total) AS cost,
-                      SUM(s.total) - SUM(s.cost_total) AS profit
-                 FROM sales s
-                 JOIN products pr ON pr.id = s.product_id
-                WHERE s.sale_date BETWEEN ? AND ?
-                  AND s.deleted_at IS NULL
-             GROUP BY pr.code, pr.name, pr.category, pr.input_unit
-             ORDER BY profit DESC""",
-            (date_from, date_to),
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
 def worker_performance(date_from: str, date_to: str):
     """Per-worker production output over the period, broken by category."""
     conn = get_connection()
     try:
-        rows = conn.execute(
-            """SELECT COALESCE(NULLIF(TRIM(p.made_by),''),'(unknown)') AS made_by,
-                      pr.category, pr.input_unit,
-                      SUM(p.quantity) AS total_qty,
-                      COUNT(*) AS runs
-                 FROM production p
-                 JOIN products pr ON pr.id = p.product_id
-                WHERE p.production_date BETWEEN ? AND ?
-                  AND p.deleted_at IS NULL
-             GROUP BY made_by, pr.category, pr.input_unit
-             ORDER BY made_by, pr.category""",
-            (date_from, date_to),
-        ).fetchall()
+        sql = """
+            SELECT COALESCE(NULLIF(TRIM(v.made_by),''),'(unknown)') AS made_by,
+                   a.category, a.unit AS input_unit,
+                   SUM(il.qty_change) AS total_qty,
+                   COUNT(DISTINCT v.id) AS runs
+            FROM vouchers v
+            JOIN inventory_ledger il ON il.voucher_id = v.id AND il.qty_change > 0
+            JOIN articles a ON a.id = il.article_id
+            WHERE v.voucher_type = 'PRODUCTION'
+              AND v.state = 'POSTED'
+              AND date(v.created_at) BETWEEN ? AND ?
+            GROUP BY made_by, a.category, a.unit
+            ORDER BY made_by, a.category
+        """
+        rows = conn.execute(sql, (date_from, date_to)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()

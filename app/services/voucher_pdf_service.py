@@ -4,6 +4,7 @@ Voucher PDF generator. Produces clean A5 voucher prints for any transaction type
   PV - Production Voucher  MV - Material Voucher  WV - Waste Voucher
 
 Designed for printing and physical sign-off.
+Queries our unified double-entry Voucher, JournalEntry, and subledger tables dynamically.
 """
 import re
 from pathlib import Path
@@ -21,67 +22,182 @@ from app.services.report_service import _register_amharic_font, _amharic_safe
 
 
 def _fetch_voucher(voucher_no: str):
-    """Find any voucher by its number across all transactional tables.
+    """Find any voucher by its number across the unified double-entry tables.
     Returns (kind, row_dict, related_dict)."""
-    prefix = voucher_no.split("-")[0].upper()
     conn = get_connection()
     try:
-        if prefix == "SV":
-            row = conn.execute(
-                """SELECT s.*, p.code AS product_code, p.name AS product_name,
-                          p.input_unit, u.username AS recorded_by
-                     FROM sales s
-                     JOIN products p ON p.id = s.product_id
-                LEFT JOIN users u ON u.id = s.user_id
-                    WHERE s.voucher_no = ?""", (voucher_no,)
+        # Get voucher header
+        v = conn.execute("SELECT * FROM vouchers WHERE voucher_no = ?", (voucher_no,)).fetchone()
+        if not v:
+            return (None, None, None)
+        v = dict(v)
+        
+        # Get username of creator
+        u = conn.execute("SELECT username FROM users WHERE id = ?", (v["created_by_id"],)).fetchone()
+        v["recorded_by"] = u["username"] if u else "(system)"
+        
+        v_type = v["voucher_type"]
+        if v_type in ("CASH_SALE", "CREDIT_SALE"):
+            # Sales Voucher
+            # Total credit to GL-4101 Sales Revenue
+            total_r = conn.execute(
+                "SELECT credit FROM journal_entries WHERE voucher_id = ? AND account_code = 'GL-4101 Sales Revenue'",
+                (v["id"],)
             ).fetchone()
-            return ("Sales Voucher", dict(row) if row else None, None)
-        if prefix == "RV":
-            row = conn.execute(
-                """SELECT cp.*, u.username AS recorded_by
-                     FROM customer_payments cp
-                LEFT JOIN users u ON u.id = cp.user_id
-                    WHERE cp.voucher_no = ?""", (voucher_no,)
+            total = total_r["credit"] if total_r else 0.0
+            
+            # Paid Debit to GL-1101 Cash on Hand
+            paid_r = conn.execute(
+                "SELECT debit FROM journal_entries WHERE voucher_id = ? AND account_code = 'GL-1101 Cash on Hand'",
+                (v["id"],)
             ).fetchone()
-            return ("Receipt Voucher", dict(row) if row else None, None)
-        if prefix == "EV":
-            row = conn.execute(
-                """SELECT e.*, u.username AS recorded_by
-                     FROM expenses e
-                LEFT JOIN users u ON u.id = e.user_id
-                    WHERE e.voucher_no = ?""", (voucher_no,)
+            paid = paid_r["debit"] if paid_r else 0.0
+            
+            # Product details
+            prod_r = conn.execute(
+                """SELECT ABS(il.qty_change) AS quantity, il.cost_rate,
+                          a.code AS product_code, a.name AS product_name, a.unit AS input_unit
+                   FROM inventory_ledger il
+                   JOIN articles a ON a.id = il.article_id
+                   WHERE il.voucher_id = ? AND il.qty_change < 0""",
+                (v["id"],)
             ).fetchone()
-            return ("Expense Voucher", dict(row) if row else None, None)
-        if prefix == "MV":
-            row = conn.execute(
-                """SELECT sm.*, m.code AS material_code, m.name AS material_name,
-                          m.unit, u.username AS recorded_by
-                     FROM stock_movements sm
-                     JOIN materials m ON m.id = sm.material_id
-                LEFT JOIN users u ON u.id = sm.user_id
-                    WHERE sm.voucher_no = ?""", (voucher_no,)
+            
+            if prod_r:
+                p = dict(prod_r)
+                v.update({
+                    "product_code": p["product_code"],
+                    "product_name": p["product_name"],
+                    "input_unit": p["input_unit"],
+                    "quantity": p["quantity"],
+                    "unit_price": round(total / p["quantity"], 2) if p["quantity"] else 0.0,
+                    "total": total,
+                    "amount_paid": paid
+                })
+            return ("Sales Voucher", v, None)
+            
+        elif v_type == "CRV":
+            # Receipt Voucher
+            # Amount credit to GL-1105 Accounts Receivable (or Debit to GL-1101)
+            je = conn.execute(
+                "SELECT debit FROM journal_entries WHERE voucher_id = ? AND account_code IN ('GL-1101 Cash on Hand', 'GL-1102 Bank')",
+                (v["id"],)
             ).fetchone()
-            return ("Material Purchase Voucher", dict(row) if row else None, None)
-        if prefix == "PV":
-            row = conn.execute(
-                """SELECT p.*, pr.code AS product_code, pr.name AS product_name,
-                          pr.input_unit, u.username AS recorded_by
-                     FROM production p
-                     JOIN products pr ON pr.id = p.product_id
-                LEFT JOIN users u ON u.id = p.user_id
-                    WHERE p.voucher_no = ?""", (voucher_no,)
+            amount = je["debit"] if je else 0.0
+            
+            # Fetch method from customer_payments if exists
+            method_r = conn.execute(
+                "SELECT method FROM customer_payments WHERE voucher_no = ?", (voucher_no,)
             ).fetchone()
-            return ("Production Voucher", dict(row) if row else None, None)
-        if prefix == "WV":
-            row = conn.execute(
-                """SELECT w.*, pr.code AS product_code, pr.name AS product_name,
-                          pr.input_unit, u.username AS recorded_by
-                     FROM waste w
-                     JOIN products pr ON pr.id = w.product_id
-                LEFT JOIN users u ON u.id = w.user_id
-                    WHERE w.voucher_no = ?""", (voucher_no,)
+            method = method_r["method"] if method_r else "cash"
+            
+            v.update({
+                "amount": amount,
+                "method": method
+            })
+            return ("Receipt Voucher", v, None)
+            
+        elif v_type == "EV":
+            # Expense Voucher
+            # Amount Debit to GL-5101 Operating Expenses
+            je = conn.execute(
+                "SELECT debit FROM journal_entries WHERE voucher_id = ? AND account_code = 'GL-5101 Operating Expenses'",
+                (v["id"],)
             ).fetchone()
-            return ("Waste Voucher", dict(row) if row else None, None)
+            amount = je["debit"] if je else 0.0
+            
+            # Category from expenses table
+            cat_r = conn.execute(
+                "SELECT category FROM expenses WHERE voucher_no = ?", (voucher_no,)
+            ).fetchone()
+            category = cat_r["category"] if cat_r else "Other"
+            
+            v.update({
+                "amount": amount,
+                "category": category,
+                "description": v["note"]
+            })
+            return ("Expense Voucher", v, None)
+            
+        elif v_type == "SRV":
+            # Material Purchase Voucher (SRV)
+            # Material details (positive inventory movement qty_change > 0)
+            mat_r = conn.execute(
+                """SELECT il.qty_change AS qty, il.cost_rate AS unit_cost,
+                          a.code AS material_code, a.name AS material_name, a.unit
+                   FROM inventory_ledger il
+                   JOIN articles a ON a.id = il.article_id
+                   WHERE il.voucher_id = ? AND il.qty_change > 0""",
+                (v["id"],)
+            ).fetchone()
+            
+            if mat_r:
+                m = dict(mat_r)
+                v.update({
+                    "material_code": m["material_code"],
+                    "material_name": m["material_name"],
+                    "unit": m["unit"],
+                    "qty": m["qty"],
+                    "unit_cost": m["unit_cost"],
+                    "supplier_name": v["customer_name"] or "General Supplier"
+                })
+            return ("Material Purchase Voucher", v, None)
+            
+        elif v_type == "PRODUCTION":
+            # Production Voucher
+            # Product details (positive qty_change > 0)
+            prod_r = conn.execute(
+                """SELECT il.qty_change AS quantity,
+                          a.code AS product_code, a.name AS product_name, a.unit AS input_unit
+                   FROM inventory_ledger il
+                   JOIN articles a ON a.id = il.article_id
+                   WHERE il.voucher_id = ? AND il.qty_change > 0""",
+                (v["id"],)
+            ).fetchone()
+            
+            v.update({
+                "cost_total": 0.0
+            })
+            
+            if prod_r:
+                p = dict(prod_r)
+                v.update({
+                    "product_code": p["product_code"],
+                    "product_name": p["product_name"],
+                    "input_unit": p["input_unit"],
+                    "quantity": p["quantity"]
+                })
+            return ("Production Voucher", v, None)
+            
+        elif v_type == "WV":
+            # Waste Voucher (WV)
+            # Product details (negative qty_change < 0)
+            prod_r = conn.execute(
+                """SELECT ABS(il.qty_change) AS quantity,
+                          a.code AS product_code, a.name AS product_name, a.unit AS input_unit
+                   FROM inventory_ledger il
+                   JOIN articles a ON a.id = il.article_id
+                   WHERE il.voucher_id = ? AND il.qty_change < 0""",
+                (v["id"],)
+            ).fetchone()
+            
+            # Reason from waste table
+            reason_r = conn.execute(
+                "SELECT reason FROM waste WHERE voucher_no = ?", (voucher_no,)
+            ).fetchone()
+            reason = reason_r["reason"] if reason_r else "damaged"
+            
+            if prod_r:
+                p = dict(prod_r)
+                v.update({
+                    "product_code": p["product_code"],
+                    "product_name": p["product_name"],
+                    "input_unit": p["input_unit"],
+                    "quantity": p["quantity"],
+                    "reason": reason
+                })
+            return ("Waste Voucher", v, None)
+            
     finally:
         conn.close()
     return (None, None, None)

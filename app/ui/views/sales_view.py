@@ -1,4 +1,8 @@
-"""Sales view: record sale + history table."""
+"""
+Sales view: handles Cash Sale Vouchers (CSV), Credit Sale Vouchers (CrSV), 
+and Cash Receipt Vouchers (CRV) for customer collections.
+Uses PaginatedTableWidget to prevent UI freeze on large logs.
+"""
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QComboBox, QDoubleSpinBox, QLineEdit, QPushButton,
@@ -6,6 +10,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QGroupBox, QFormLayout, QMessageBox, QTabWidget)
 
 from app.services import product_service, sales_service
+from app.ui.widgets.paginated_table import PaginatedTableWidget
 
 
 class SalesView(QWidget):
@@ -17,25 +22,28 @@ class SalesView(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        try: self.refresh()
-        except Exception: pass
+        try: 
+            self.refresh()
+        except Exception: 
+            pass
 
     def _build(self):
         outer = QVBoxLayout(self); outer.setContentsMargins(20,20,20,20); outer.setSpacing(12)
 
-        t = QLabel("Sales")
-        t.setObjectName("pagetitle")
+        t = QLabel("Sales Vouchers")
+        t.setStyleSheet("font-size: 22px; font-weight: bold; color: #1F4E79;")
         outer.addWidget(t)
 
         self.tabs = QTabWidget()
 
-        # New sale
-        new = QWidget(); v = QVBoxLayout(new)
+        # --- Tab 1: New Sale (CSV / CrSV) ---
+        new_sale_tab = QWidget(); v = QVBoxLayout(new_sale_tab)
 
-        gb = QGroupBox("Record Sale")
+        gb = QGroupBox("Record Sale Voucher")
         form = QFormLayout(gb)
 
-        self.category = QComboBox(); self.category.addItems(["HCB","TERAZO","PIPE"])
+        self.category = QComboBox()
+        self.category.addItems(["HCB", "TERAZO", "PIPE"])
         self.category.currentTextChanged.connect(self._reload_products)
         form.addRow("Category:", self.category)
 
@@ -43,58 +51,108 @@ class SalesView(QWidget):
         self.product.currentIndexChanged.connect(self._product_changed)
         form.addRow("Product:", self.product)
 
-        self.stock_lbl = QLabel("—"); self.stock_lbl.setObjectName("hintmedium")
-        form.addRow("In stock:", self.stock_lbl)
+        self.stock_lbl = QLabel("—")
+        self.stock_lbl.setStyleSheet("color: #6B7B8C;")
+        form.addRow("Available Stock:", self.stock_lbl)
 
-        self.customer = QLineEdit(); self.customer.setPlaceholderText("Customer name")
-        form.addRow("Customer:", self.customer)
+        self.payment_type = QComboBox()
+        self.payment_type.addItems(["Cash (CSV)", "Credit (CrSV)"])
+        form.addRow("Payment Term:", self.payment_type)
 
-        self.qty = QDoubleSpinBox(); self.qty.setRange(0, 1_000_000); self.qty.setDecimals(2)
+        self.customer = QLineEdit()
+        self.customer.setPlaceholderText("Customer Name")
+        form.addRow("Customer Name:", self.customer)
+
+        self.qty = QDoubleSpinBox()
+        self.qty.setRange(0, 1_000_000); self.qty.setDecimals(2)
         self.qty.valueChanged.connect(self._recalc_total)
         self.qty_unit = QLabel("pieces")
         qr = QHBoxLayout(); qr.addWidget(self.qty); qr.addWidget(self.qty_unit); qr.addStretch()
-        form.addRow("Quantity:", qr)
+        form.addRow("Quantity sold:", qr)
 
-        self.price = QDoubleSpinBox(); self.price.setRange(0, 1_000_000); self.price.setDecimals(2)
+        self.price = QDoubleSpinBox()
+        self.price.setRange(0, 1_000_000); self.price.setDecimals(2)
         self.price.valueChanged.connect(self._recalc_total)
         form.addRow("Unit price (ETB):", self.price)
 
         self.total_lbl = QLabel("0.00 ETB")
         self.total_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #27AE60;")
-        form.addRow("Total:", self.total_lbl)
+        form.addRow("Valuation Total:", self.total_lbl)
 
-        self.paid = QDoubleSpinBox(); self.paid.setRange(0, 1_000_000_000); self.paid.setDecimals(2)
-        form.addRow("Amount paid now (0 = full cash):", self.paid)
-
-        self.note = QLineEdit(); self.note.setPlaceholderText("Optional note")
+        self.note = QLineEdit(); self.note.setPlaceholderText("Optional memo note")
         form.addRow("Note:", self.note)
 
         v.addWidget(gb)
-        btn_row = QHBoxLayout(); btn_row.addStretch()
-        btn = QPushButton("✓ Record Sale"); btn.setObjectName("success"); btn.clicked.connect(self._confirm)
+        
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn = QPushButton("✓ Post Sale Voucher")
+        btn.setObjectName("success")
+        btn.clicked.connect(self._confirm_sale)
         btn_row.addWidget(btn)
         v.addLayout(btn_row)
 
-        self.tabs.addTab(new, "New Sale")
+        self.tabs.addTab(new_sale_tab, "New Sale Voucher")
 
-        # History
-        ht = QWidget(); vh = QVBoxLayout(ht)
-        # Search bar above history table
+        # --- Tab 2: Cash Receipts (CRV) Debt Collection ---
+        crv_tab = QWidget(); v_crv = QVBoxLayout(crv_tab)
+        
+        gb_crv = QGroupBox("Record Cash Receipt Voucher (CRV)")
+        form_crv = QFormLayout(gb_crv)
+        
+        self.crv_customer = QLineEdit()
+        self.crv_customer.setPlaceholderText("Customer name (depositing payment)")
+        form_crv.addRow("Customer Name:", self.crv_customer)
+        
+        self.crv_amount = QDoubleSpinBox()
+        self.crv_amount.setRange(0, 50_000_000)
+        self.crv_amount.setDecimals(2)
+        form_crv.addRow("Amount Collected (ETB):", self.crv_amount)
+        
+        self.crv_note = QLineEdit()
+        self.crv_note.setPlaceholderText("Check number, Bank transfer receipt reference")
+        form_crv.addRow("Collection Reference / Note:", self.crv_note)
+        
+        v_crv.addWidget(gb_crv)
+        
+        btn_row_crv = QHBoxLayout()
+        btn_row_crv.addStretch()
+        btn_crv = QPushButton("✓ Post CRV Receipt")
+        btn_crv.setObjectName("success")
+        btn_crv.clicked.connect(self._confirm_crv)
+        btn_row_crv.addWidget(btn_crv)
+        v_crv.addLayout(btn_row_crv)
+        
+        self.tabs.addTab(crv_tab, "Cash Receipt (CRV)")
+
+        # --- Tab 3: Sales History ---
+        sales_hist_tab = QWidget(); vh = QVBoxLayout(sales_hist_tab)
         from app.ui.widgets.search_box import SearchBox
-        self.search = SearchBox(None, placeholder="Search sales by product, customer, date, note, total…")
+        self.search = SearchBox(None, placeholder="Search sales by product, customer, date, note…")
         vh.addWidget(self.search)
 
-        self.history = QTableWidget(0, 11)
-        self.history.setHorizontalHeaderLabels(
-            ["Date","Product","Customer","Qty","Unit Price","Total","Paid","Balance","User","Note","Actions"])
-        self.history.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.history.horizontalHeader().setSectionResizeMode(10, QHeaderView.ResizeToContents)
-        self.history.verticalHeader().setVisible(False)
-        self.history.setAlternatingRowColors(True)
-        self.history.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.search.attach(self.history)
+        self.history = PaginatedTableWidget(
+            ["Voucher No", "Date", "Product", "Customer", "Qty", "Unit Price", "Total", "User", "Note"],
+            lambda limit, offset: sales_service.list_sales(limit=limit, offset=offset),
+            self._fill_sales_table
+        )
+        self.search.attach(self.history.table)
         vh.addWidget(self.history)
-        self.tabs.addTab(ht, "Sales History")
+        self.tabs.addTab(sales_hist_tab, "Sales Voucher History")
+
+        # --- Tab 4: CRV Collection History ---
+        crv_hist_tab = QWidget(); vh_crv = QVBoxLayout(crv_hist_tab)
+        self.search_crv = SearchBox(None, placeholder="Search cash receipts by customer, voucher, note…")
+        vh_crv.addWidget(self.search_crv)
+
+        self.crv_history = PaginatedTableWidget(
+            ["Voucher No", "Date/Time", "Customer", "Amount Collected", "Recorded By", "Reference/Note"],
+            lambda limit, offset: sales_service.list_cash_receipts(limit=limit, offset=offset),
+            self._fill_crv_table
+        )
+        self.search_crv.attach(self.crv_history.table)
+        vh_crv.addWidget(self.crv_history)
+        self.tabs.addTab(crv_hist_tab, "Cash Receipt History")
 
         outer.addWidget(self.tabs)
         self._reload_products()
@@ -122,116 +180,86 @@ class SalesView(QWidget):
     def _recalc_total(self):
         self.total_lbl.setText(f"{self.qty.value() * self.price.value():,.2f} ETB")
 
-    def _confirm(self):
+    def _confirm_sale(self):
         pid = self.product.currentData()
         if pid is None or self.qty.value() <= 0:
-            QMessageBox.warning(self, "Invalid", "Pick a product and quantity > 0."); return
-        # Empty customer name is fine (anonymous cash sale) — no warning needed.
+            QMessageBox.warning(self, "Invalid", "Pick a product and quantity > 0.")
+            return
+        if not self.customer.text().strip():
+            if QMessageBox.question(self, "No customer name",
+                "Customer name is empty. Continue?") != QMessageBox.Yes:
+                return
+                
+        payment_term = "CASH" if "Cash" in self.payment_type.currentText() else "CREDIT"
         try:
-            paid = self.paid.value() if self.paid.value() > 0 else None
-            sale_id = sales_service.record_sale(
+            sales_service.record_sale(
                 product_id=pid,
                 customer_name=self.customer.text().strip() or None,
                 quantity=self.qty.value(),
                 unit_price=self.price.value(),
                 user_id=self.user["id"],
                 note=self.note.text() or None,
-                amount_paid=paid,
+                payment_type=payment_term
             )
-            sale = sales_service.get_sale(sale_id)
-            vno = (sale or {}).get("voucher_no") or "-"
-            if QMessageBox.question(
-                self, "Sale recorded",
-                f"Sale recorded as {vno}.\nPrint receipt now?"
-            ) == QMessageBox.Yes:
-                self._print_receipt(sale_id)
+            QMessageBox.information(self, "Posted", "Sales Voucher posted successfully.")
             self.qty.setValue(0); self.customer.clear(); self.note.clear()
-            self.paid.setValue(0)
             self.refresh()
         except ValueError as e:
             QMessageBox.warning(self, "Cannot proceed", str(e))
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
-    def _print_receipt(self, sale_id):
-        from app.services import sales_service, voucher_pdf_service
-        from app.utils.paths import RECEIPTS
-        from PyQt5.QtWidgets import QFileDialog
-        sale = sales_service.get_sale(sale_id)
-        if not sale or not sale.get("voucher_no"):
-            QMessageBox.warning(self, "No voucher", "This sale has no voucher number.")
+    def _confirm_crv(self):
+        customer = self.crv_customer.text().strip()
+        amount = self.crv_amount.value()
+        if not customer:
+            QMessageBox.warning(self, "Missing Customer", "Customer name is required.")
             return
-        vno = sale["voucher_no"]
-        RECEIPTS.mkdir(parents=True, exist_ok=True)
-        out = RECEIPTS / f"{vno}.pdf"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save receipt", str(out), "PDF Files (*.pdf)")
-        if not path:
+        if amount <= 0:
+            QMessageBox.warning(self, "Invalid Amount", "Collection amount must be positive.")
             return
+            
         try:
-            voucher_pdf_service.export_voucher(vno, path)
-            QMessageBox.information(self, "Receipt saved", f"Saved to:\n{path}")
-        except PermissionError:
-            QMessageBox.critical(self, "Cannot save",
-                f"Cannot write to:\n{path}\n\n"
-                "The file may be open in another program. Close it and try again.")
+            sales_service.record_cash_receipt(
+                customer_name=customer,
+                amount=amount,
+                user_id=self.user["id"],
+                note=self.crv_note.text().strip() or None
+            )
+            QMessageBox.information(self, "Posted", "Cash Receipt Voucher (CRV) posted successfully.")
+            self.crv_customer.clear()
+            self.crv_amount.setValue(0.0)
+            self.crv_note.clear()
+            self.refresh()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
     def refresh(self):
         self._product_changed()
-        rows = sales_service.list_sales(limit=500)
-        self.history.setRowCount(len(rows))
-        for r, s in enumerate(rows):
-            self.history.setItem(r, 0, QTableWidgetItem(s["sale_date"]))
-            self.history.setItem(r, 1, QTableWidgetItem(f"{s['product_code']} — {s['product_name']}"))
-            self.history.setItem(r, 2, QTableWidgetItem(s.get("customer_name") or ""))
-            self.history.setItem(r, 3, QTableWidgetItem(f"{s['quantity']:.2f}"))
-            self.history.setItem(r, 4, QTableWidgetItem(f"{s['unit_price']:,.2f}"))
-            self.history.setItem(r, 5, QTableWidgetItem(f"{s['total']:,.2f}"))
-            paid = s.get("amount_paid") or 0
-            self.history.setItem(r, 6, QTableWidgetItem(f"{paid:,.2f}"))
-            bal = (s.get("balance") or 0)
-            bal_item = QTableWidgetItem(f"{bal:,.2f}")
-            if bal > 0:
-                bal_item.setForeground(Qt.red)
-            self.history.setItem(r, 7, bal_item)
-            self.history.setItem(r, 8, QTableWidgetItem(s.get("user_name") or ""))
-            self.history.setItem(r, 9, QTableWidgetItem(s.get("note") or ""))
-
-            actions = QWidget(); ah = QHBoxLayout(actions); ah.setContentsMargins(0,0,0,0); ah.setSpacing(4)
-            rb = QPushButton("🖨"); rb.setMaximumWidth(34); rb.setToolTip("Receipt")
-            rb.clicked.connect(lambda _, sid=s["id"]: self._print_receipt(sid))
-            ah.addWidget(rb)
-            if self.user["role"] == "admin":
-                eb = QPushButton("✎"); eb.setMaximumWidth(34); eb.setToolTip("Edit")
-                eb.clicked.connect(lambda _, sid=s["id"]: self._edit_sale(sid))
-                db = QPushButton("🗑"); db.setObjectName("danger"); db.setMaximumWidth(34); db.setToolTip("Delete")
-                db.clicked.connect(lambda _, sid=s["id"]: self._delete_sale(sid))
-                ah.addWidget(eb); ah.addWidget(db)
-            self.history.setCellWidget(r, 10, actions)
+        self.history.refresh()
         if hasattr(self, "search"):
             self.search.reapply()
+        self.crv_history.refresh()
+        if hasattr(self, "search_crv"):
+            self.search_crv.reapply()
 
-    def _edit_sale(self, sale_id):
-        from app.ui.views.dialogs.edit_sale_dialog import EditSaleDialog
-        try:
-            dlg = EditSaleDialog(sale_id, self.user, self)
-        except ValueError as e:
-            QMessageBox.warning(self, "Not available", str(e)); return
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e)); return
-        if dlg.exec_() == dlg.Accepted:
-            self.refresh()
+    def _fill_sales_table(self, table, data):
+        for r, s in enumerate(data):
+            table.setItem(r, 0, QTableWidgetItem(s.get("voucher_no") or ""))
+            table.setItem(r, 1, QTableWidgetItem(s["sale_date"]))
+            table.setItem(r, 2, QTableWidgetItem(f"{s['product_code']} — {s['product_name']}"))
+            table.setItem(r, 3, QTableWidgetItem(s.get("customer_name") or ""))
+            table.setItem(r, 4, QTableWidgetItem(f"{s['quantity']:.2f}"))
+            table.setItem(r, 5, QTableWidgetItem(f"{s['unit_price']:,.2f}"))
+            table.setItem(r, 6, QTableWidgetItem(f"{s['total']:,.2f}"))
+            table.setItem(r, 7, QTableWidgetItem(s.get("user_name") or ""))
+            table.setItem(r, 8, QTableWidgetItem(s.get("note") or ""))
 
-    def _delete_sale(self, sale_id):
-        from PyQt5.QtWidgets import QInputDialog
-        reason, ok = QInputDialog.getText(self, "Delete sale", "Reason (required):")
-        if not ok or not reason.strip():
-            return
-        try:
-            sales_service.delete_sale(sale_id, user_id=self.user["id"], reason=reason.strip())
-            QMessageBox.information(self, "Deleted", "Sale deleted; stock restored.")
-            self.refresh()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+    def _fill_crv_table(self, table, data):
+        for r, c in enumerate(data):
+            table.setItem(r, 0, QTableWidgetItem(c.get("voucher_no") or ""))
+            table.setItem(r, 1, QTableWidgetItem(c["created_at"]))
+            table.setItem(r, 2, QTableWidgetItem(c["customer_name"]))
+            table.setItem(r, 3, QTableWidgetItem(f"{c['amount']:,.2f}"))
+            table.setItem(r, 4, QTableWidgetItem(c.get("user_name") or ""))
+            table.setItem(r, 5, QTableWidgetItem(c.get("note") or ""))

@@ -10,7 +10,10 @@ from PyQt5.QtCore import Qt, QDate
 
 from app.services import backup_service, report_service, accounting_export_service
 from app.ui.voucher_helper import print_voucher
-from app.utils.paths import BACKUPS, ACCOUNTING
+from app.database.db import DB_PATH
+
+BACKUPS = DB_PATH.parent.parent / "backups"
+ACCOUNTING = DB_PATH.parent.parent / "exports"
 
 
 class ToolsView(QWidget):
@@ -55,12 +58,12 @@ class ToolsView(QWidget):
         vv.addWidget(QLabel(
             "Every transaction (sale, payment, expense, purchase, production, waste) "
             "has a unique voucher number you can re-print at any time. "
-            "Prefixes: SV (Sales) · RV (Receipt) · EV (Expense) · "
-            "MV (Material) · PV (Production) · WV (Waste)."
+            "Prefixes: CASH_SALE / CREDIT_SALE · CRV (Receipt) · EV (Expense) · "
+            "SRV (Material) · PRODUCTION · WV (Waste)."
         ))
         vrow = QHBoxLayout()
         self.voucher_input = QLineEdit()
-        self.voucher_input.setPlaceholderText("Voucher number, e.g. SV-00042")
+        self.voucher_input.setPlaceholderText("Voucher number, e.g. CRV-20260529-0001")
         vrow.addWidget(self.voucher_input, stretch=1)
         vb = QPushButton("🖨  Print Voucher"); vb.clicked.connect(self._lookup_voucher)
         vrow.addWidget(vb)
@@ -178,6 +181,7 @@ class ToolsView(QWidget):
         )
         if confirm != QMessageBox.Yes: return
 
+        BACKUPS.mkdir(parents=True, exist_ok=True)
         path, _ = QFileDialog.getOpenFileName(
             self, "Choose backup file to restore", str(BACKUPS), "SQLite Database (*.db)"
         )

@@ -1,18 +1,14 @@
 """
-Products + Formulas view (Admin only).
-
-- Lists products, lets admin edit sell price and stock alert per product.
-- Per-product formula editor lets admin change qty_per_unit values.
-  When saved, formulas are inserted/updated with effective_from = today
-  so historical production records are unaffected.
+Products + Formulas view (Owner/Manager permission protected).
+Focused on catalog pricing, stock alerts, and production formulas.
 """
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                              QTableWidget, QTableWidgetItem, QHeaderView,
                              QDialog, QFormLayout, QDoubleSpinBox, QLineEdit,
-                             QMessageBox, QTabWidget, QComboBox)
+                             QMessageBox, QComboBox)
 
-from app.services import product_service, inventory_service
+from app.services import product_service, inventory_service, auth_service
 
 
 class _FormulaEditor(QDialog):
@@ -26,7 +22,7 @@ class _FormulaEditor(QDialog):
         unit_text = "per 1 piece" if product["input_unit"] == "piece" else "per 1 m²"
         hint = QLabel(f"All quantities are {unit_text}. "
                       f"Changes take effect today; past production records are not affected.")
-        hint.setObjectName("hintmedium"); hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6B7B8C;"); hint.setWordWrap(True)
         v.addWidget(hint)
 
         self.table = QTableWidget(0, 3)
@@ -38,7 +34,6 @@ class _FormulaEditor(QDialog):
         # Load
         materials = inventory_service.list_materials()
         active = product_service.get_active_formula(product["id"])
-        # Build a row per material so admin can fill ones currently missing
         self.table.setRowCount(len(materials))
         self._row_to_mat = {}
         for r, m in enumerate(materials):
@@ -61,7 +56,6 @@ class _FormulaEditor(QDialog):
         v.addLayout(btn_row)
 
     def values(self):
-        """Return dict material_id -> qty."""
         out = {}
         for r, mid in self._row_to_mat.items():
             w = self.table.cellWidget(r, 2)
@@ -99,46 +93,46 @@ class ProductsView(QWidget):
     def __init__(self, user):
         super().__init__()
         self.user = user
-        self._build(); self.refresh()
+        self._build()
+        self.refresh()
 
     def showEvent(self, event):
         super().showEvent(event)
-        try: self.refresh()
-        except Exception: pass
+        try: 
+            self.refresh()
+        except Exception: 
+            pass
 
     def _build(self):
-        outer = QVBoxLayout(self); outer.setContentsMargins(20,20,20,20); outer.setSpacing(12)
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(12)
 
         head = QHBoxLayout()
-        t = QLabel("Products & Formulas")
-        t.setObjectName("pagetitle")
-        head.addWidget(t); head.addStretch()
-        head.addWidget(QLabel("Category:"))
-        self.cat = QComboBox(); self.cat.addItems(["All","HCB","TERAZO","PIPE"])
+        head.addWidget(QLabel("Category Filter:"))
+        self.cat = QComboBox(); self.cat.addItems(["All", "HCB", "TERAZO", "PIPE"])
         self.cat.currentTextChanged.connect(self.refresh)
         head.addWidget(self.cat)
+        head.addStretch()
         rb = QPushButton("⟳ Refresh"); rb.setObjectName("secondary"); rb.clicked.connect(self.refresh)
         head.addWidget(rb)
         outer.addLayout(head)
 
-        # Search bar above the products table
         from app.ui.widgets.search_box import SearchBox
         self.search = SearchBox(None, placeholder="Search products by code, name, category…")
         outer.addWidget(self.search)
 
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Code","Name","Category","Input","Sell Price","Stock","Actions"])
+            ["Code", "Name", "Category", "Input", "Sell Price", "Curing+Sales Stock", "Actions"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        # Search only across the first 4 text columns (code, name, category, input)
         self.search.attach(self.table, columns=[0, 1, 2, 3])
         outer.addWidget(self.table)
 
     def refresh(self):
+        # Refresh product table
         cat = self.cat.currentText()
         prods = product_service.list_products(None if cat == "All" else cat)
         self.table.setRowCount(len(prods))
@@ -148,6 +142,7 @@ class ProductsView(QWidget):
             self.table.setItem(r, 2, QTableWidgetItem(p["category"]))
             self.table.setItem(r, 3, QTableWidgetItem("piece" if p["input_unit"]=="piece" else "m²"))
             self.table.setItem(r, 4, QTableWidgetItem(f"{p['sell_price']:,.2f}"))
+            
             unit_disp = "pcs" if p["input_unit"] == "piece" else "m²"
             self.table.setItem(r, 5, QTableWidgetItem(f"{p['stock']:.2f} {unit_disp}"))
 
@@ -156,29 +151,38 @@ class ProductsView(QWidget):
             edit_s = QPushButton("Settings"); edit_s.clicked.connect(lambda _, pid=p["id"]: self._edit_settings(pid))
             h.addWidget(edit_f); h.addWidget(edit_s)
             self.table.setCellWidget(r, 6, act)
+            
         if hasattr(self, "search"):
             self.search.reapply()
 
     def _edit_formula(self, pid):
-        if self.user["role"] != "admin":
-            QMessageBox.warning(self, "Permission denied", "Admins only."); return
+        if not auth_service.has_permission(self.user["id"], "system:update-price"):
+            from app.ui.widgets.override_dialog import request_override
+            if not request_override("system:update-price", self):
+                return
         p = product_service.get_product(pid)
         dlg = _FormulaEditor(p, self)
-        if dlg.exec_() != QDialog.Accepted: return
+        if dlg.exec_() != QDialog.Accepted: 
+            return
         for mid, qty in dlg.values().items():
             product_service.upsert_formula(pid, mid, qty)
         QMessageBox.information(self, "Saved", "Formula updated.")
         self.refresh()
 
     def _edit_settings(self, pid):
-        if self.user["role"] != "admin":
-            QMessageBox.warning(self, "Permission denied", "Admins only."); return
+        if not auth_service.has_permission(self.user["id"], "system:update-price"):
+            from app.ui.widgets.override_dialog import request_override
+            if not request_override("system:update-price", self):
+                return
         p = product_service.get_product(pid)
         dlg = _ProductSettings(p, self)
-        if dlg.exec_() != QDialog.Accepted: return
+        if dlg.exec_() != QDialog.Accepted: 
+            return
         product_service.update_product(
-            pid, sell_price=dlg.price.value(),
+            pid, 
+            sell_price=dlg.price.value(),
             low_stock_alert=dlg.alert.value(),
             name=dlg.name.text() or None,
         )
         self.refresh()
+

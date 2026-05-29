@@ -13,13 +13,9 @@ from app.database.seed import seed_initial_data
 from app.ui.login_window import LoginWindow
 from app.ui.main_window import MainWindow
 from app.utils.theme import apply_theme
-from app.utils.paths import ensure_all
 
 
 def main():
-    # Make sure every output folder exists before anything else writes
-    ensure_all()
-
     # Initialize SQLite database (creates tables if not exist)
     init_database()
     # Seed materials, products, formulas, and default admin user (idempotent)

@@ -1,449 +1,374 @@
 """
-SQLite database connection and schema setup.
-All tables created here. The schema is designed so that:
-- Formulas are stored in DB (not hardcoded) and editable from the UI.
-- Stock movements are append-only for full history/audit trail.
-- Formula versions are preserved by date so historical production records
-  remain accurate even if formulas change later.
+SQLAlchemy database setup and transactional migration.
+Provides raw connections for backward compatibility and SQLAlchemy sessions.
 """
+import os
 import sqlite3
 from pathlib import Path
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from app.database.models import (
+    Base, User, Permission, UserPermission, Article, Formula, Voucher, 
+    InventoryLedger, JournalEntry, AuditLog, AppMeta, Supplier, Customer, 
+    CustomerPayment, Expense, Waste
+)
 
-from app.utils.paths import DATA_DIR
+# Database file location
+DB_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+DB_DIR.mkdir(exist_ok=True)
+DB_PATH = DB_DIR / "factory.db"
 
-# Database file lives in <app folder>/data/factory.db
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "factory.db"
+# SQLAlchemy Setup
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+engine = create_engine(
+    DATABASE_URL, 
+    connect_args={"check_same_thread": False}
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def get_session():
+    """Return a new SQLAlchemy Session instance."""
+    return SessionLocal()
 
 
 def get_connection():
-    """Return a new SQLite connection with foreign keys enabled and row factory."""
+    """Return a raw sqlite3 connection (backward compatibility for views/reports)."""
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
-SCHEMA = """
--- ============================================================
--- USERS
--- ============================================================
-CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    full_name     TEXT,
-    role          TEXT NOT NULL CHECK(role IN ('admin','worker')),
-    created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-);
-
--- ============================================================
--- RAW MATERIALS  (cement, sand, pumice, teter00, teter01, water, ቀለም)
--- Each material has a unit and a low-stock threshold.
--- Current stock is computed from the stock_movements ledger,
--- but we also cache it here for quick dashboard reads.
--- ============================================================
-CREATE TABLE IF NOT EXISTS materials (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    code            TEXT UNIQUE NOT NULL,        -- e.g. 'CEMENT', 'TETER00'
-    name            TEXT NOT NULL,               -- display name (supports Amharic)
-    unit            TEXT NOT NULL,               -- 'kg', 'm3', 'liter'
-    current_stock   REAL NOT NULL DEFAULT 0,
-    low_stock_alert REAL NOT NULL DEFAULT 0,
-    unit_cost       REAL NOT NULL DEFAULT 0      -- ETB per unit, optional
-);
-
--- Append-only ledger of every stock change.
--- Positive qty = added, negative = consumed.
-CREATE TABLE IF NOT EXISTS stock_movements (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    material_id INTEGER NOT NULL REFERENCES materials(id),
-    qty         REAL NOT NULL,                   -- signed
-    movement    TEXT NOT NULL CHECK(movement IN ('purchase','production','adjustment','initial')),
-    reference   TEXT,                            -- e.g. production_id or supplier name
-    note        TEXT,
-    user_id     INTEGER REFERENCES users(id),
-    created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-);
-
--- ============================================================
--- PRODUCTS  (HCB blocks + Terazo tiles)
--- input_unit is what the user enters:
---   'piece' for HCB
---   'm2'    for Terazo (kare)
--- ============================================================
-CREATE TABLE IF NOT EXISTS products (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    code         TEXT UNIQUE NOT NULL,           -- 'HCB10N', 'TERAZO_30x30x5', 'TUBO_30', ...
-    name         TEXT NOT NULL,
-    category     TEXT NOT NULL CHECK(category IN ('HCB','TERAZO','PIPE')),
-    input_unit   TEXT NOT NULL CHECK(input_unit IN ('piece','m2')),
-    stock        REAL NOT NULL DEFAULT 0,        -- finished goods on hand
-    sell_price   REAL NOT NULL DEFAULT 0,        -- ETB per piece or per m2
-    low_stock_alert REAL NOT NULL DEFAULT 0
-);
-
--- ============================================================
--- FORMULAS  (per 1 input_unit of product, per material)
--- Versioned by effective_from date.  When admin edits a formula
--- we INSERT a new row; old production records still resolve to
--- the formula that was active on their production date.
--- ============================================================
-CREATE TABLE IF NOT EXISTS formulas (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id     INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-    material_id    INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
-    qty_per_unit   REAL NOT NULL,                -- material qty per 1 piece or 1 m2
-    effective_from TEXT NOT NULL DEFAULT (date('now','localtime')),
-    UNIQUE(product_id, material_id, effective_from)
-);
-
--- ============================================================
--- PRODUCTION RUNS
--- ============================================================
-CREATE TABLE IF NOT EXISTS production (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id    INTEGER NOT NULL REFERENCES products(id),
-    quantity      REAL NOT NULL,                 -- pieces or m2
-    production_date TEXT NOT NULL DEFAULT (date('now','localtime')),
-    user_id       INTEGER REFERENCES users(id),     -- who recorded it in the system
-    made_by       TEXT,                             -- which worker physically made it (free text)
-    note          TEXT,
-    created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-);
-
--- Snapshot of which materials and how much were consumed for each production run.
--- Stored so reports stay correct even if formulas are edited later.
-CREATE TABLE IF NOT EXISTS production_consumption (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    production_id INTEGER NOT NULL REFERENCES production(id) ON DELETE CASCADE,
-    material_id   INTEGER NOT NULL REFERENCES materials(id),
-    qty_consumed  REAL NOT NULL
-);
-
--- ============================================================
--- SALES
--- ============================================================
-CREATE TABLE IF NOT EXISTS sales (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id    INTEGER NOT NULL REFERENCES products(id),
-    customer_name TEXT,
-    quantity      REAL NOT NULL,
-    unit_price    REAL NOT NULL,
-    total         REAL NOT NULL,
-    sale_date     TEXT NOT NULL DEFAULT (date('now','localtime')),
-    user_id       INTEGER REFERENCES users(id),
-    note          TEXT,
-    created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-);
-
--- ============================================================
--- AUDIT LOG (lightweight)
--- ============================================================
-CREATE TABLE IF NOT EXISTS audit_log (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER REFERENCES users(id),
-    action     TEXT NOT NULL,
-    details    TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-);
-
--- ============================================================
--- APP META  (migration flags, schema version, etc.)
--- ============================================================
-CREATE TABLE IF NOT EXISTS app_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-
--- ============================================================
--- v3 ADDITIONS
--- ============================================================
-
--- Suppliers (raw material vendors)
-CREATE TABLE IF NOT EXISTS suppliers (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT UNIQUE NOT NULL,
-    phone      TEXT,
-    address    TEXT,
-    note       TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-);
-
--- Customers (kept lightweight — also used informally via sales.customer_name)
-CREATE TABLE IF NOT EXISTS customers (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT UNIQUE NOT NULL,
-    phone      TEXT,
-    address    TEXT,
-    note       TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-);
-
--- Customer payments (settle outstanding balances on credit sales)
-CREATE TABLE IF NOT EXISTS customer_payments (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    customer_name TEXT NOT NULL,
-    amount        REAL NOT NULL,
-    payment_date  TEXT NOT NULL DEFAULT (date('now','localtime')),
-    method        TEXT,                       -- 'cash','bank','etc'
-    note          TEXT,
-    user_id       INTEGER REFERENCES users(id),
-    created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-);
-
--- Expenses (salaries, utilities, etc.)
-CREATE TABLE IF NOT EXISTS expenses (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    category     TEXT NOT NULL,               -- 'Labor','Utilities','Rent','Transport','Maintenance','Other'
-    amount       REAL NOT NULL,
-    expense_date TEXT NOT NULL DEFAULT (date('now','localtime')),
-    description  TEXT,
-    user_id      INTEGER REFERENCES users(id),
-    created_at   TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-);
-
--- Damaged / wasted finished goods
-CREATE TABLE IF NOT EXISTS waste (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id  INTEGER NOT NULL REFERENCES products(id),
-    quantity    REAL NOT NULL,                -- always positive; the action is implicitly a stock reduction
-    reason      TEXT,                         -- 'cracked','rejected','dropped',...
-    waste_date  TEXT NOT NULL DEFAULT (date('now','localtime')),
-    user_id     INTEGER REFERENCES users(id),
-    note        TEXT,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_stock_mov_mat ON stock_movements(material_id);
-CREATE INDEX IF NOT EXISTS idx_stock_mov_date ON stock_movements(created_at);
-CREATE INDEX IF NOT EXISTS idx_production_date ON production(production_date);
-CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(sale_date);
-CREATE INDEX IF NOT EXISTS idx_formula_prod ON formulas(product_id);
-CREATE INDEX IF NOT EXISTS idx_payments_customer ON customer_payments(customer_name);
-CREATE INDEX IF NOT EXISTS idx_payments_date ON customer_payments(payment_date);
-CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(expense_date);
-CREATE INDEX IF NOT EXISTS idx_waste_date ON waste(waste_date);
-"""
-
-
 def init_database():
-    """Create tables if they do not exist, and apply migrations."""
-    conn = get_connection()
+    """Initialize database tables, run migrations, and enable WAL mode."""
+    # Enable WAL mode via raw connection first
+    conn = sqlite3.connect(str(DB_PATH))
     try:
-        conn.executescript(SCHEMA)
-        conn.commit()
-        _run_migrations(conn)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        
+        # Check if old tables exist to trigger migration
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='materials'")
+        has_old_db = cursor.fetchone() is not None
+        
+        if has_old_db:
+            print("Old database version detected. Starting migration...")
+            _migrate_old_database(conn)
+            print("Migration completed successfully.")
+        else:
+            # Safe creation of new tables
+            Base.metadata.create_all(engine)
+            
+            # Ensure all columns exist in vouchers table (dynamic upgrade check)
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vouchers'")
+            if cursor.fetchone() is not None:
+                cursor.execute("PRAGMA table_info(vouchers)")
+                columns = [row[1] for row in cursor.fetchall()]
+                if "note" not in columns:
+                    conn.execute("ALTER TABLE vouchers ADD COLUMN note TEXT")
+                if "customer_name" not in columns:
+                    conn.execute("ALTER TABLE vouchers ADD COLUMN customer_name TEXT")
+                if "made_by" not in columns:
+                    conn.execute("ALTER TABLE vouchers ADD COLUMN made_by TEXT")
+                conn.commit()
     finally:
         conn.close()
 
 
-def _migration_done(conn, key: str) -> bool:
-    row = conn.execute("SELECT value FROM app_meta WHERE key = ?", (key,)).fetchone()
-    return row is not None and row["value"] == "1"
-
-
-def _mark_migration_done(conn, key: str):
-    conn.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES (?,?)",
-                 (key, "1"))
-    conn.commit()
-
-
-def _column_exists(conn, table: str, column: str) -> bool:
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return any(r["name"] == column for r in rows)
-
-
-def _run_migrations(conn):
-    """Apply schema migrations to existing databases.
-    Each migration is idempotent (gated by app_meta flag or column existence check).
+def _migrate_old_database(raw_conn):
     """
-    # ----------------------------------------------------------------
-    # Migration: add made_by column to production
-    # ----------------------------------------------------------------
-    if not _column_exists(conn, "production", "made_by"):
-        try:
-            conn.execute("ALTER TABLE production ADD COLUMN made_by TEXT")
-            conn.commit()
-        except Exception:
-            pass  # column may have been added in a parallel run
-
-    # ----------------------------------------------------------------
-    # Migration: allow PIPE category on products
-    # SQLite cannot alter CHECK constraints in-place — rebuild the table.
-    # ----------------------------------------------------------------
-    if not _migration_done(conn, "products_allow_pipe_category_v1"):
-        # Determine if the existing CHECK already includes 'PIPE'.
-        # Easiest: try inserting + rolling back a PIPE row; if it fails, rebuild.
-        needs_rebuild = False
-        try:
-            conn.execute(
-                """INSERT INTO products (code, name, category, input_unit)
-                   VALUES ('__pipe_probe__', '__probe__', 'PIPE', 'piece')"""
+    Reads all legacy database entries, drops old tables, 
+    creates the new unified schema, and populates the double-entry structures.
+    """
+    raw_conn.row_factory = sqlite3.Row
+    cursor = raw_conn.cursor()
+    
+    # 1. Fetch old data into memory
+    old_users = cursor.execute("SELECT * FROM users").fetchall()
+    old_materials = cursor.execute("SELECT * FROM materials").fetchall()
+    old_products = cursor.execute("SELECT * FROM products").fetchall()
+    old_formulas = cursor.execute("SELECT * FROM formulas").fetchall()
+    old_production = cursor.execute("SELECT * FROM production").fetchall()
+    old_consumption = cursor.execute("SELECT * FROM production_consumption").fetchall()
+    old_sales = cursor.execute("SELECT * FROM sales").fetchall()
+    old_movements = cursor.execute("SELECT * FROM stock_movements").fetchall()
+    old_audit = cursor.execute("SELECT * FROM audit_log").fetchall()
+    
+    # 2. Drop old tables (turn off foreign keys temporarily for drop)
+    raw_conn.execute("PRAGMA foreign_keys = OFF")
+    tables_to_drop = [
+        "app_meta", "audit_log", "sales", "production_consumption", 
+        "production", "formulas", "products", "stock_movements", 
+        "materials", "users"
+    ]
+    for table in tables_to_drop:
+        raw_conn.execute(f"DROP TABLE IF EXISTS {table}")
+    raw_conn.commit()
+    raw_conn.execute("PRAGMA foreign_keys = ON")
+    
+    # 3. Create new schema using SQLAlchemy metadata
+    Base.metadata.create_all(engine)
+    
+    # 4. Insert data using a clean SQLAlchemy Session
+    session = SessionLocal()
+    try:
+        # Create map of old IDs to new objects
+        user_map = {}
+        article_map = {}  # code -> Article ORM object
+        
+        # A. Migrate Users
+        default_admin_id = None
+        for u in old_users:
+            # Map old roles (admin, worker) to new (owner, cashier)
+            role = "owner" if u["role"] == "admin" else "cashier"
+            new_u = User(
+                username=u["username"],
+                password_hash=u["password_hash"],
+                full_name=u["full_name"],
+                role=role,
+                created_at=datetime.strptime(u["created_at"], "%Y-%m-%d %H:%M:%S") if " " in u["created_at"] else datetime.now()
             )
-            # success — clean up the probe row
-            conn.execute("DELETE FROM products WHERE code = '__pipe_probe__'")
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            needs_rebuild = True
-
-        if needs_rebuild:
-            try:
-                conn.execute("PRAGMA foreign_keys = OFF")
-                conn.executescript("""
-                    BEGIN;
-                    CREATE TABLE products_new (
-                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                        code         TEXT UNIQUE NOT NULL,
-                        name         TEXT NOT NULL,
-                        category     TEXT NOT NULL CHECK(category IN ('HCB','TERAZO','PIPE')),
-                        input_unit   TEXT NOT NULL CHECK(input_unit IN ('piece','m2')),
-                        stock        REAL NOT NULL DEFAULT 0,
-                        sell_price   REAL NOT NULL DEFAULT 0,
-                        low_stock_alert REAL NOT NULL DEFAULT 0
-                    );
-                    INSERT INTO products_new (id, code, name, category, input_unit,
-                                              stock, sell_price, low_stock_alert)
-                    SELECT id, code, name, category, input_unit,
-                           stock, sell_price, low_stock_alert
-                    FROM products;
-                    DROP TABLE products;
-                    ALTER TABLE products_new RENAME TO products;
-                    COMMIT;
-                """)
-            finally:
-                conn.execute("PRAGMA foreign_keys = ON")
-                conn.commit()
-        _mark_migration_done(conn, "products_allow_pipe_category_v1")
-
-    # ----------------------------------------------------------------
-    # Migration: zero out TeTer00/TeTer01 for HCB N-variants
-    # ----------------------------------------------------------------
-    if not _migration_done(conn, "hcb_n_variant_zero_teter_v1"):
-        cur = conn.execute(
-            """SELECT p.id AS pid, m.id AS mid, m.code AS mcode
-                 FROM products p, materials m
-                WHERE p.code IN ('HCB10N','HCB15N','HCB20N')
-                  AND m.code IN ('TETER00','TETER01')"""
-        ).fetchall()
-        # Insert a new formula version dated today setting these to 0,
-        # so historical production records keep their old values.
-        from app.utils import clock
-        today = clock.today()
-        for r in cur:
-            existing = conn.execute(
-                """SELECT id FROM formulas
-                    WHERE product_id = ? AND material_id = ?
-                      AND effective_from = ?""",
-                (r["pid"], r["mid"], today),
-            ).fetchone()
-            if existing:
-                conn.execute("UPDATE formulas SET qty_per_unit = 0 WHERE id = ?",
-                             (existing["id"],))
+            session.add(new_u)
+            session.flush()
+            user_map[u["id"]] = new_u.id
+            if u["username"] == "admin":
+                default_admin_id = new_u.id
+                
+        if not default_admin_id and user_map:
+            default_admin_id = list(user_map.values())[0]
+            
+        # B. Migrate Materials (Raw Articles)
+        for m in old_materials:
+            art = Article(
+                code=m["code"],
+                name=m["name"],
+                category="RAW",
+                unit=m["unit"],
+                cost_price=m["unit_cost"],
+                warehouse_qty=m["current_stock"],
+                shop_floor_qty=0.0,
+                low_stock_alert=m["low_stock_alert"],
+                is_active=True
+            )
+            session.add(art)
+            session.flush()
+            article_map[m["code"]] = art
+            
+        # C. Migrate Products (Finished Articles)
+        for p in old_products:
+            art = Article(
+                code=p["code"],
+                name=p["name"],
+                category=p["category"],
+                unit=p["input_unit"],
+                sell_price=p["sell_price"],
+                warehouse_qty=0.0,
+                shop_floor_qty=p["stock"],
+                low_stock_alert=p["low_stock_alert"],
+                is_active=True
+            )
+            session.add(art)
+            session.flush()
+            article_map[p["code"]] = art
+            
+        # D. Migrate Formulas
+        # Map old raw material and product IDs via code strings
+        old_mat_code = {m["id"]: m["code"] for m in old_materials}
+        old_prod_code = {p["id"]: p["code"] for p in old_products}
+        
+        for f in old_formulas:
+            p_code = old_prod_code.get(f["product_id"])
+            m_code = old_mat_code.get(f["material_id"])
+            if p_code in article_map and m_code in article_map:
+                prod = article_map[p_code]
+                mat = article_map[m_code]
+                
+                # Check for default effective_from
+                eff_from = f["effective_from"] if "effective_from" in f.keys() else "2026-01-01"
+                
+                new_f = Formula(
+                    product_id=prod.id,
+                    material_id=mat.id,
+                    qty_per_unit=f["qty_per_unit"],
+                    effective_from=eff_from
+                )
+                session.add(new_f)
+        
+        session.flush()
+        
+        # Helper to parse dates
+        def parse_date(date_str):
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(date_str, fmt)
+                except ValueError:
+                    pass
+            return datetime.now()
+            
+        # E. Migrate Raw Stock Purchases (from old stock_movements)
+        # Old movements mapping: purchase -> Store Receipt Voucher (SRV)
+        # adjustment -> Stock Adjustment Voucher
+        srv_counter = 1
+        adj_counter = 1
+        
+        for mov in old_movements:
+            m_code = old_mat_code.get(mov["material_id"])
+            if m_code not in article_map:
+                continue
+            art = article_map[m_code]
+            
+            # Skip movements tied to production (production_service handles it separately)
+            if mov["movement"] == "production":
+                continue
+                
+            v_type = "SRV" if mov["movement"] == "purchase" else "ADJUSTMENT"
+            v_no = f"MIG-{v_type}-{(srv_counter if v_type == 'SRV' else adj_counter):05d}"
+            if v_type == "SRV":
+                srv_counter += 1
             else:
-                conn.execute(
-                    """INSERT INTO formulas (product_id, material_id, qty_per_unit, effective_from)
-                       VALUES (?,?,0,?)""",
-                    (r["pid"], r["mid"], today),
-                )
-        conn.commit()
-        _mark_migration_done(conn, "hcb_n_variant_zero_teter_v1")
-
-    # ----------------------------------------------------------------
-    # v3 migrations: new columns for profit, supplier, credit sales, soft delete
-    # ----------------------------------------------------------------
-    if not _column_exists(conn, "production", "cost_total"):
-        try:
-            conn.execute("ALTER TABLE production ADD COLUMN cost_total REAL DEFAULT 0")
-            conn.commit()
-        except Exception:
-            pass
-
-    if not _column_exists(conn, "production", "deleted_at"):
-        try:
-            conn.execute("ALTER TABLE production ADD COLUMN deleted_at TEXT")
-            conn.commit()
-        except Exception:
-            pass
-
-    if not _column_exists(conn, "sales", "amount_paid"):
-        try:
-            # Default = total (legacy sales assumed fully paid in cash)
-            conn.execute("ALTER TABLE sales ADD COLUMN amount_paid REAL")
-            conn.execute("UPDATE sales SET amount_paid = total WHERE amount_paid IS NULL")
-            conn.commit()
-        except Exception:
-            pass
-
-    if not _column_exists(conn, "sales", "cost_total"):
-        try:
-            conn.execute("ALTER TABLE sales ADD COLUMN cost_total REAL DEFAULT 0")
-            conn.commit()
-        except Exception:
-            pass
-
-    if not _column_exists(conn, "sales", "deleted_at"):
-        try:
-            conn.execute("ALTER TABLE sales ADD COLUMN deleted_at TEXT")
-            conn.commit()
-        except Exception:
-            pass
-
-    if not _column_exists(conn, "stock_movements", "supplier_name"):
-        try:
-            conn.execute("ALTER TABLE stock_movements ADD COLUMN supplier_name TEXT")
-            conn.commit()
-        except Exception:
-            pass
-
-    if not _column_exists(conn, "stock_movements", "unit_cost"):
-        try:
-            conn.execute("ALTER TABLE stock_movements ADD COLUMN unit_cost REAL")
-            conn.commit()
-        except Exception:
-            pass
-
-    # ----------------------------------------------------------------
-    # v4 migrations: voucher numbers on every transactional table
-    # ----------------------------------------------------------------
-    for tbl in ("sales", "production", "expenses", "customer_payments",
-                "stock_movements", "waste"):
-        if not _column_exists(conn, tbl, "voucher_no"):
-            try:
-                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN voucher_no TEXT")
-                conn.commit()
-            except Exception:
-                pass
-
-    # Backfill voucher numbers on existing rows
-    if not _migration_done(conn, "voucher_backfill_v1"):
-        # Each prefix has its own counter
-        configs = [
-            ("sales",             "SV"),  # Sales Voucher
-            ("customer_payments", "RV"),  # Receipt Voucher
-            ("expenses",          "EV"),  # Expense Voucher
-            ("production",        "PV"),  # Production Voucher
-            ("waste",             "WV"),  # Waste Voucher
-            # stock purchases (movement='purchase') become Material Vouchers (MV)
-        ]
-        for tbl, prefix in configs:
-            rows = conn.execute(
-                f"SELECT id FROM {tbl} WHERE voucher_no IS NULL ORDER BY id"
-            ).fetchall()
-            for i, r in enumerate(rows, start=1):
-                conn.execute(
-                    f"UPDATE {tbl} SET voucher_no = ? WHERE id = ?",
-                    (f"{prefix}-{i:05d}", r["id"]),
-                )
-        # Stock movements: only the 'purchase' movements get MV numbers
-        purchases = conn.execute(
-            "SELECT id FROM stock_movements WHERE movement='purchase' AND voucher_no IS NULL ORDER BY id"
-        ).fetchall()
-        for i, r in enumerate(purchases, start=1):
-            conn.execute(
-                "UPDATE stock_movements SET voucher_no = ? WHERE id = ?",
-                (f"MV-{i:05d}", r["id"]),
+                adj_counter += 1
+                
+            v = Voucher(
+                voucher_no=v_no,
+                voucher_type=v_type,
+                state="POSTED",
+                created_at=parse_date(mov["created_at"]),
+                created_by_id=user_map.get(mov["user_id"], default_admin_id),
+                note=mov["note"]
             )
-        conn.commit()
-        _mark_migration_done(conn, "voucher_backfill_v1")
+            session.add(v)
+            session.flush()
+            
+            # Stock addition
+            ledger = InventoryLedger(
+                voucher_id=v.id,
+                article_id=art.id,
+                qty_change=mov["qty"],
+                cost_rate=art.cost_price,
+                location="WAREHOUSE"
+            )
+            session.add(ledger)
+            
+            # Balanced Journal Entry
+            account = "GL-1102 Raw Stock"
+            offset = "GL-2101 Accounts Payable" if v_type == "SRV" else "GL-5109 Stock Variance"
+            
+            if mov["qty"] >= 0:
+                val = mov["qty"] * art.cost_price
+                session.add(JournalEntry(voucher_id=v.id, account_code=account, debit=val, credit=0.0))
+                session.add(JournalEntry(voucher_id=v.id, account_code=offset, debit=0.0, credit=val))
+            else:
+                val = abs(mov["qty"]) * art.cost_price
+                session.add(JournalEntry(voucher_id=v.id, account_code=offset, debit=val, credit=0.0))
+                session.add(JournalEntry(voucher_id=v.id, account_code=account, debit=0.0, credit=val))
+                
+        # F. Migrate Production Records
+        # Legacy production increments finished products and consumes raw materials
+        prod_counter = 1
+        for pr in old_production:
+            p_code = old_prod_code.get(pr["product_id"])
+            if p_code not in article_map:
+                continue
+            prod_art = article_map[p_code]
+            
+            v_no = f"MIG-PRD-{prod_counter:05d}"
+            prod_counter += 1
+            
+            v = Voucher(
+                voucher_no=v_no,
+                voucher_type="PRODUCTION",
+                state="POSTED",
+                created_at=parse_date(pr["created_at"]),
+                created_by_id=user_map.get(pr["user_id"], default_admin_id),
+                note=pr["note"],
+                made_by=pr["made_by"]
+            )
+            session.add(v)
+            session.flush()
+            
+            # Increment Finished Goods (Shop Floor Location)
+            session.add(InventoryLedger(
+                voucher_id=v.id,
+                article_id=prod_art.id,
+                qty_change=pr["quantity"],
+                cost_rate=prod_art.cost_price,
+                location="SHOP_FLOOR"
+            ))
+            
+            # Deduct Raw Materials consumed
+            # Find consumption rows for this production
+            related_cons = [c for c in old_consumption if c["production_id"] == pr["id"]]
+            for cons in related_cons:
+                m_code = old_mat_code.get(cons["material_id"])
+                if m_code in article_map:
+                    mat_art = article_map[m_code]
+                    session.add(InventoryLedger(
+                        voucher_id=v.id,
+                        article_id=mat_art.id,
+                        qty_change=-cons["qty_consumed"],
+                        cost_rate=mat_art.cost_price,
+                        location="WAREHOUSE"
+                    ))
+            
+            # Balanced Production Journal Entries
+            val_finished = pr["quantity"] * prod_art.sell_price  # fallback estimate
+            session.add(JournalEntry(voucher_id=v.id, account_code="GL-1104 Finished Goods", debit=val_finished, credit=0.0))
+            session.add(JournalEntry(voucher_id=v.id, account_code="GL-1103 WIP Inventory", debit=0.0, credit=val_finished))
+            
+        # G. Migrate Sales Records
+        sale_counter = 1
+        for s in old_sales:
+            p_code = old_prod_code.get(s["product_id"])
+            if p_code not in article_map:
+                continue
+            prod_art = article_map[p_code]
+            
+            v_no = f"MIG-SAL-{sale_counter:05d}"
+            sale_counter += 1
+            
+            v = Voucher(
+                voucher_no=v_no,
+                voucher_type="CASH_SALE",
+                state="POSTED",
+                created_at=parse_date(s["created_at"]),
+                created_by_id=user_map.get(s["user_id"], default_admin_id),
+                note=s["note"],
+                customer_name=s["customer_name"]
+            )
+            session.add(v)
+            session.flush()
+            
+            # Decrement finished block stock
+            session.add(InventoryLedger(
+                voucher_id=v.id,
+                article_id=prod_art.id,
+                qty_change=-s["quantity"],
+                cost_rate=prod_art.cost_price,
+                location="SHOP_FLOOR"
+            ))
+            
+            # Balanced General Ledger Sale Entries
+            # Debit Cash, Credit Revenue
+            session.add(JournalEntry(voucher_id=v.id, account_code="GL-1101 Cash on Hand", debit=s["total"], credit=0.0))
+            session.add(JournalEntry(voucher_id=v.id, account_code="GL-4101 Sales Revenue", debit=0.0, credit=s["total"]))
+            
+        # H. Migrate Audit Logs
+        for log in old_audit:
+            new_log = AuditLog(
+                user_id=user_map.get(log["user_id"], default_admin_id),
+                action=log["action"],
+                details=log["details"],
+                created_at=parse_date(log["created_at"])
+            )
+            session.add(new_log)
+            
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(f"Error executing database migration: {e}")
+        raise e
+    finally:
+        session.close()

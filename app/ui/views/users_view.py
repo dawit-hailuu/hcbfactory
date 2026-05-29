@@ -11,15 +11,13 @@ class _NewUserDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("New User")
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(360)
         f = QFormLayout(self)
         self.username = QLineEdit(); f.addRow("Username:", self.username)
         self.fullname = QLineEdit(); f.addRow("Full name:", self.fullname)
-        self.role = QComboBox(); self.role.addItems(["worker","admin"]); f.addRow("Role:", self.role)
+        self.role = QComboBox(); self.role.addItems(["owner", "manager", "cashier"]); f.addRow("Role:", self.role)
         self.password = QLineEdit(); self.password.setEchoMode(QLineEdit.Password)
         f.addRow("Password:", self.password)
-        self.password2 = QLineEdit(); self.password2.setEchoMode(QLineEdit.Password)
-        f.addRow("Confirm password:", self.password2)
         br = QHBoxLayout()
         ok = QPushButton("Create"); ok.clicked.connect(self.accept)
         cancel = QPushButton("Cancel"); cancel.setObjectName("secondary"); cancel.clicked.connect(self.reject)
@@ -30,12 +28,10 @@ class _PasswordDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Change Password")
-        self.setMinimumWidth(340)
+        self.setMinimumWidth(320)
         f = QFormLayout(self)
         self.pw = QLineEdit(); self.pw.setEchoMode(QLineEdit.Password)
         f.addRow("New password:", self.pw)
-        self.pw2 = QLineEdit(); self.pw2.setEchoMode(QLineEdit.Password)
-        f.addRow("Confirm password:", self.pw2)
         br = QHBoxLayout()
         ok = QPushButton("Save"); ok.clicked.connect(self.accept)
         cancel = QPushButton("Cancel"); cancel.setObjectName("secondary"); cancel.clicked.connect(self.reject)
@@ -48,15 +44,10 @@ class UsersView(QWidget):
         self.current_user = current_user
         self._build(); self.refresh()
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        try: self.refresh()
-        except Exception: pass
-
     def _build(self):
         outer = QVBoxLayout(self); outer.setContentsMargins(20,20,20,20); outer.setSpacing(12)
         head = QHBoxLayout()
-        t = QLabel("Users"); t.setObjectName("pagetitle")
+        t = QLabel("Users"); t.setStyleSheet("font-size: 22px; font-weight: bold; color: #1F4E79;")
         head.addWidget(t); head.addStretch()
         add = QPushButton("➕ New User"); add.setObjectName("success"); add.clicked.connect(self._new)
         head.addWidget(add)
@@ -92,39 +83,21 @@ class UsersView(QWidget):
     def _new(self):
         dlg = _NewUserDialog(self)
         if dlg.exec_() != QDialog.Accepted: return
-        username = dlg.username.text().strip()
-        pw = dlg.password.text()
-        pw2 = dlg.password2.text()
-        if not username or not pw:
-            QMessageBox.warning(self, "Required", "Username and password are required."); return
-        if len(pw) < 4:
-            QMessageBox.warning(self, "Password too short", "Use at least 4 characters."); return
-        if pw != pw2:
-            QMessageBox.warning(self, "Passwords don't match", "The two passwords must be identical."); return
+        if not dlg.username.text().strip() or not dlg.password.text():
+            QMessageBox.warning(self, "Invalid","Username and password are required."); return
         try:
             auth_service.create_user(
-                username, pw,
+                dlg.username.text().strip(), dlg.password.text(),
                 dlg.fullname.text().strip(), dlg.role.currentText())
             self.refresh()
         except Exception as e:
-            err = str(e)
-            if "UNIQUE" in err.upper():
-                QMessageBox.warning(self, "Username taken",
-                                    f"A user named '{username}' already exists.")
-            else:
-                QMessageBox.critical(self, "Error", err)
+            QMessageBox.critical(self, "Error", str(e))
 
     def _change_pw(self, uid):
         dlg = _PasswordDialog(self)
         if dlg.exec_() != QDialog.Accepted: return
-        pw = dlg.pw.text(); pw2 = dlg.pw2.text()
-        if not pw:
-            return
-        if len(pw) < 4:
-            QMessageBox.warning(self, "Password too short", "Use at least 4 characters."); return
-        if pw != pw2:
-            QMessageBox.warning(self, "Passwords don't match", "The two passwords must be identical."); return
-        auth_service.change_password(uid, pw)
+        if not dlg.pw.text(): return
+        auth_service.change_password(uid, dlg.pw.text())
         QMessageBox.information(self, "Done", "Password updated.")
 
     def _delete(self, uid, username):
