@@ -104,18 +104,21 @@ class ExpensesView(QWidget):
             self.table.setItem(r, 3, QTableWidgetItem(f"{e['amount']:,.2f}"))
             self.table.setItem(r, 4, QTableWidgetItem(e.get("description") or ""))
             self.table.setItem(r, 5, QTableWidgetItem(e.get("user_name") or ""))
-            # Actions cell with print + (admin) delete
+            
+            # Actions cell with print + (owner/manager) delete
             from PyQt5.QtWidgets import QWidget, QHBoxLayout
             from app.ui.voucher_helper import print_voucher
             actions = QWidget(); ah = QHBoxLayout(actions); ah.setContentsMargins(0,0,0,0); ah.setSpacing(4)
             pb = QPushButton("🖨"); pb.setMaximumWidth(34); pb.setToolTip("Print voucher")
             pb.clicked.connect(lambda _, v=e.get("voucher_no"): print_voucher(self, v))
             ah.addWidget(pb)
-            if self.user["role"] == "admin":
+            
+            if self.user["role"] in ("owner", "manager"):
                 db = QPushButton("🗑"); db.setObjectName("danger"); db.setMaximumWidth(34)
                 db.clicked.connect(lambda _, eid=e["id"]: self._delete(eid))
                 ah.addWidget(db)
             self.table.setCellWidget(r, 6, actions)
+            
         # Summary across all
         totals = expense_service.expense_summary("2000-01-01", "2100-12-31")
         all_sum = sum(t["total"] for t in totals)

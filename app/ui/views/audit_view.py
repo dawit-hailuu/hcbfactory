@@ -5,7 +5,6 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushBut
 from app.services import audit_service
 from app.ui.widgets.search_box import SearchBox
 
-
 ACTION_LABELS = {
     "login_success":     "Login (success)",
     "login_failure":     "Login (FAILED)",

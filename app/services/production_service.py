@@ -1,25 +1,18 @@
 """
 Production service.
-
-`calculate_consumption(product_id, qty)` returns a list of (material, needed_qty)
-without touching the DB — used by the UI to preview before confirming.
-
-`record_production(...)` runs the actual transaction:
-  - inserts the production row
-  - looks up the active formula
-  - inserts a snapshot row per material into production_consumption
-  - decrements raw material stock (via inventory_service.record_movement)
-  - increments finished-product stock
-all atomically.
+Coordinates batch manufacturing logs, material consumption audits, 
+and posts Production Vouchers directly to the double-entry ledger.
 """
-from app.database.db import get_connection
-from app.services import product_service, inventory_service
+from sqlalchemy import func
+from app.database.db import get_session, get_connection
+from app.database.models import Voucher, InventoryLedger, JournalEntry, Article, User
+from app.services import product_service, inventory_service, ledger_service
 from app.utils import clock
-
+from datetime import datetime
 
 def calculate_consumption(product_id: int, quantity: float, on_date: str = None):
     """
-    Return list of dicts {material_id, material_code, material_name, unit,
+    Returns list of dicts {material_id, material_code, material_name, unit,
                           qty_per_unit, qty_needed, available, sufficient}
     for the given product + production quantity.
     """
@@ -33,7 +26,7 @@ def calculate_consumption(product_id: int, quantity: float, on_date: str = None)
     for mat_id, fdata in formula.items():
         needed = fdata["qty_per_unit"] * quantity
         mat = materials.get(mat_id, {})
-        available = mat.get("current_stock", 0)
+        available = mat.get("current_stock", 0.0)
         result.append({
             "material_id":   mat_id,
             "material_code": fdata["material_code"],
@@ -44,34 +37,20 @@ def calculate_consumption(product_id: int, quantity: float, on_date: str = None)
             "available":     available,
             "sufficient":    available >= needed,
         })
-    # Sort for stable UI display
     result.sort(key=lambda r: r["material_name"])
     return result
 
-
 def has_sufficient_materials(product_id: int, quantity: float):
-    """Quick check: returns (bool ok, list of insufficient material names)."""
     consumption = calculate_consumption(product_id, quantity)
     short = [c["material_name"] for c in consumption if not c["sufficient"]]
     return (len(short) == 0, short)
-
 
 def record_production(product_id: int, quantity: float, user_id: int = None,
                       note: str = None, made_by: str = None,
                       allow_negative_stock: bool = False):
     """
-    Atomically:
-      - insert production row
-      - compute consumption from active formula
-      - deduct each material via stock_movements ledger
-      - snapshot consumption into production_consumption
-      - increase finished-product stock
-
-    `made_by` is the free-text name of the worker who physically made the blocks.
-    Distinct from `user_id` which is who recorded the entry.
-
-    Raises ValueError if materials insufficient (unless allow_negative_stock=True).
-    Returns the new production_id.
+    Atomically creates a PRODUCTION Voucher, consumes raw materials, 
+    increments finished blocks, and balances the accounting journal.
     """
     if quantity <= 0:
         raise ValueError("production quantity must be positive")
@@ -85,223 +64,233 @@ def record_production(product_id: int, quantity: float, user_id: int = None,
                               f"{c['unit']}, have {c['available']:.3f})" for c in short)
             raise ValueError(f"Insufficient raw materials: {names}")
 
-    conn = get_connection()
+    session = get_session()
     try:
-        cur = conn.cursor()
-        # Compute total material cost for this run (for profit tracking)
-        material_costs = {
-            r["id"]: r["unit_cost"] or 0
-            for r in cur.execute("SELECT id, unit_cost FROM materials").fetchall()
-        }
-        cost_total = sum(c["qty_needed"] * material_costs.get(c["material_id"], 0)
-                         for c in consumption)
+        prod_art = session.query(Article).filter_by(id=product_id).first()
+        if not prod_art:
+            raise ValueError("Product not found")
 
-        from app.services import voucher_service, audit_service
-        voucher_no = voucher_service.next_voucher("PV", conn=conn)
-
-        cur.execute(
-            """INSERT INTO production
-                 (product_id, quantity, user_id, note, made_by,
-                  production_date, created_at, cost_total, voucher_no)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (product_id, quantity, user_id, note, made_by,
-             clock.today(), clock.now(), cost_total, voucher_no),
+        # 1. Create Voucher Header
+        v = ledger_service.create_voucher(
+            session=session,
+            voucher_type="PRODUCTION",
+            created_by_id=user_id or 1
         )
-        production_id = cur.lastrowid
+        v.note = note
+        v.made_by = made_by
+        session.flush()
 
-        # consume materials + snapshot
+        # 2. Add Finished Product (Curing Yard / Warehouse)
+        ledger_service.post_inventory_movement(
+            session=session,
+            voucher_id=v.id,
+            article_id=product_id,
+            qty_change=quantity,
+            location="WAREHOUSE",
+            cost_rate=prod_art.sell_price
+        )
+
+        # 3. Deduct consumed materials (Warehouse)
+        total_material_cost = 0.0
         for c in consumption:
             if c["qty_needed"] <= 0:
                 continue
-            inventory_service.record_movement(
-                material_id=c["material_id"],
-                qty=-c["qty_needed"],
-                movement="production",
-                user_id=user_id,
-                reference=f"production#{production_id}",
-                note=f"Used for {quantity} of product {product_id}",
-                conn=conn,
-            )
-            cur.execute(
-                """INSERT INTO production_consumption (production_id, material_id, qty_consumed)
-                   VALUES (?,?,?)""",
-                (production_id, c["material_id"], c["qty_needed"]),
+            
+            mat_art = session.query(Article).filter_by(id=c["material_id"]).first()
+            cost_price = mat_art.cost_price or 0.0
+            total_material_cost += c["qty_needed"] * cost_price
+            
+            ledger_service.post_inventory_movement(
+                session=session,
+                voucher_id=v.id,
+                article_id=c["material_id"],
+                qty_change=-c["qty_needed"],
+                location="WAREHOUSE",
+                cost_rate=cost_price
             )
 
-        # increment finished-product stock
-        cur.execute("UPDATE products SET stock = stock + ? WHERE id = ?",
-                    (quantity, product_id))
-
-        conn.commit()
-        audit_service.log(
-            user_id, "production_create",
-            f"{voucher_no} product_id={product_id} qty={quantity} made_by={made_by or '-'}"
+        # 4. Balanced Journal Entry
+        # Debit Finished Goods, Credit WIP/Raw Materials
+        finished_valuation = quantity * prod_art.sell_price
+        ledger_service.post_journal_entry(
+            session=session,
+            voucher_id=v.id,
+            account_code="GL-1104 Finished Goods",
+            debit=finished_valuation,
+            credit=0.0
         )
-        return production_id
-    except Exception:
-        conn.rollback()
-        raise
+        ledger_service.post_journal_entry(
+            session=session,
+            voucher_id=v.id,
+            account_code="GL-1103 WIP Inventory",
+            debit=0.0,
+            credit=finished_valuation
+        )
+
+        session.commit()
+        return v.id
+    except Exception as e:
+        session.rollback()
+        raise e
     finally:
-        conn.close()
+        session.close()
 
-
-def list_production(limit: int = 200, date_from: str = None, date_to: str = None,
-                    include_deleted: bool = False):
+def list_production(limit: int = 200, date_from: str = None, date_to: str = None, offset: int = 0, include_deleted: bool = False):
+    """Retrieves all manufacturing runs from Production Vouchers."""
     conn = get_connection()
     try:
-        where = ["1=1"]
+        where = ["v.voucher_type = 'PRODUCTION'"]
         params = []
+        
         if not include_deleted:
-            where.append("p.deleted_at IS NULL")
+            where.append("v.state = 'POSTED'")
         if date_from:
-            where.append("p.production_date >= ?")
+            where.append("date(v.created_at) >= ?")
             params.append(date_from)
         if date_to:
-            where.append("p.production_date <= ?")
+            where.append("date(v.created_at) <= ?")
             params.append(date_to)
+            
         clause = "WHERE " + " AND ".join(where)
-        params.append(limit)
-        rows = conn.execute(
-            f"""SELECT p.*, pr.code AS product_code, pr.name AS product_name,
-                       pr.input_unit, u.username AS user_name
-                FROM production p
-                JOIN products pr ON pr.id = p.product_id
-                LEFT JOIN users u ON u.id = p.user_id
-                {clause}
-                ORDER BY p.id DESC LIMIT ?""", params
-        ).fetchall()
-        return [dict(r) for r in rows]
+        params.extend([limit, offset])
+
+        # In a Production Voucher, the finished product addition is the positive ledger change.
+        sql = f"""
+            SELECT v.id, v.voucher_no, v.created_at, v.note, v.made_by, v.state,
+                   datetime(v.created_at) AS created_at_str,
+                   date(v.created_at) AS production_date,
+                   u.username AS user_name, v.created_by_id AS user_id,
+                   il.qty_change AS quantity,
+                   a.id AS product_id, a.code AS product_code, a.name AS product_name, a.unit AS input_unit
+             FROM vouchers v
+             JOIN inventory_ledger il ON il.voucher_id = v.id AND il.qty_change > 0
+             JOIN articles a ON a.id = il.article_id
+             LEFT JOIN users u ON u.id = v.created_by_id
+             {clause}
+             ORDER BY v.id DESC LIMIT ? OFFSET ?
+        """
+        rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "voucher_no": r["voucher_no"],
+                "product_id": r["product_id"],
+                "product_code": r["product_code"],
+                "product_name": r["product_name"],
+                "input_unit": r["input_unit"],
+                "quantity": r["quantity"],
+                "production_date": r["production_date"],
+                "created_at": r["created_at_str"],
+                "user_id": r["user_id"],
+                "user_name": r["user_name"],
+                "made_by": r["made_by"],
+                "note": r["note"],
+                "state": r["state"]
+            } for r in rows
+        ]
     finally:
         conn.close()
-
 
 def get_production(production_id: int):
+    """Fetches details of a specific production run."""
     conn = get_connection()
     try:
-        row = conn.execute(
-            """SELECT p.*, pr.code AS product_code, pr.name AS product_name,
-                      pr.input_unit
-                 FROM production p
-                 JOIN products pr ON pr.id = p.product_id
-                WHERE p.id = ?""",
-            (production_id,)
-        ).fetchone()
-        return dict(row) if row else None
+        sql = """
+            SELECT v.id, v.voucher_no, v.created_at, v.note, v.made_by, v.state,
+                   datetime(v.created_at) AS created_at_str,
+                   date(v.created_at) AS production_date,
+                   u.username AS user_name, v.created_by_id AS user_id,
+                   il.qty_change AS quantity,
+                   a.id AS product_id, a.code AS product_code, a.name AS product_name, a.unit AS input_unit
+             FROM vouchers v
+             JOIN inventory_ledger il ON il.voucher_id = v.id AND il.qty_change > 0
+             JOIN articles a ON a.id = il.article_id
+             LEFT JOIN users u ON u.id = v.created_by_id
+             WHERE v.id = ?
+        """
+        r = conn.execute(sql, (production_id,)).fetchone()
+        if r:
+            return {
+                "id": r["id"],
+                "voucher_no": r["voucher_no"],
+                "product_id": r["product_id"],
+                "product_code": r["product_code"],
+                "product_name": r["product_name"],
+                "input_unit": r["input_unit"],
+                "quantity": r["quantity"],
+                "production_date": r["production_date"],
+                "created_at": r["created_at_str"],
+                "user_id": r["user_id"],
+                "user_name": r["user_name"],
+                "made_by": r["made_by"],
+                "note": r["note"],
+                "state": r["state"]
+            }
+        return None
     finally:
         conn.close()
-
 
 def delete_production(production_id: int, user_id: int = None, reason: str = None):
-    """Soft-delete a production run. Reverses the inventory effects:
-    raw materials are added back, finished stock is reduced.
-    Audit log records the reason. The original row stays in the DB with
-    deleted_at set, so reports can still surface it if needed.
-    """
-    from app.services import audit_service
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        prod = cur.execute(
-            "SELECT * FROM production WHERE id = ? AND deleted_at IS NULL",
-            (production_id,)
-        ).fetchone()
-        if prod is None:
-            raise ValueError("Production run not found (or already deleted)")
-
-        # Reverse the material consumption
-        consumed = cur.execute(
-            """SELECT material_id, qty_consumed FROM production_consumption
-                WHERE production_id = ?""", (production_id,)
-        ).fetchall()
-        for c in consumed:
-            inventory_service.record_movement(
-                material_id=c["material_id"],
-                qty=+c["qty_consumed"],
-                movement="adjustment",
-                user_id=user_id,
-                reference=f"reverse_production#{production_id}",
-                note=f"Reversal of deleted production run #{production_id}",
-                conn=conn,
-            )
-
-        # Reduce finished product stock
-        cur.execute("UPDATE products SET stock = stock - ? WHERE id = ?",
-                    (prod["quantity"], prod["product_id"]))
-
-        # Soft-delete
-        cur.execute("UPDATE production SET deleted_at = ? WHERE id = ?",
-                    (clock.now(), production_id))
-        conn.commit()
-        audit_service.log(
-            user_id, "production_delete",
-            f"id={production_id} qty={prod['quantity']} reason={reason or '-'}"
-        )
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
+    """Voids the production run voucher transactionally."""
+    ledger_service.void_voucher(production_id, user_id or 1)
 
 def update_production(production_id: int, quantity: float = None,
                       made_by: str = None, note: str = None, user_id: int = None,
                       reason: str = None):
-    """Edit a production run. The cleanest correct approach is to delete + re-create;
-    we do that internally so material consumption and stock stay consistent.
-    Returns the new production_id."""
-    from app.services import audit_service
+    """Edits a production run by voiding the old voucher and creating a new one."""
     existing = get_production(production_id)
     if existing is None:
         raise ValueError("Production run not found")
-    if existing.get("deleted_at"):
-        raise ValueError("Cannot edit a deleted production run")
+    if existing.get("state") == "VOIDED":
+        raise ValueError("Cannot edit a voided production run")
 
-    new_qty   = quantity if quantity is not None else existing["quantity"]
-    new_made  = made_by if made_by is not None else existing.get("made_by")
-    new_note  = note if note is not None else existing.get("note")
+    new_qty = quantity if quantity is not None else existing["quantity"]
+    new_made = made_by if made_by is not None else existing.get("made_by")
+    new_note = note if note is not None else existing.get("note")
 
-    # First reverse the original, then create the corrected version
-    delete_production(production_id, user_id=user_id,
-                      reason=f"edited{(' — ' + reason) if reason else ''}")
-    new_id = record_production(
-        product_id=existing["product_id"], quantity=new_qty,
-        user_id=user_id, note=new_note, made_by=new_made,
+    # 1. Void the existing production run
+    delete_production(production_id, user_id=user_id, reason=reason)
+
+    # 2. Record the corrected production run
+    return record_production(
+        product_id=existing["product_id"],
+        quantity=new_qty,
+        user_id=user_id,
+        note=new_note,
+        made_by=new_made,
+        allow_negative_stock=True
     )
-    audit_service.log(
-        user_id, "production_edit",
-        f"old_id={production_id} new_id={new_id} qty={existing['quantity']} -> {new_qty}"
-    )
-    return new_id
-
 
 def recent_made_by(limit: int = 10):
-    """Return the last `limit` distinct non-empty 'made_by' values,
-    most-recently-used first. Used for autocomplete on the Production form."""
-    conn = get_connection()
+    """Retrieves unique operator/worker names from recent production logs."""
+    session = get_session()
     try:
-        rows = conn.execute(
-            """SELECT made_by, MAX(id) AS last_seen
-               FROM production
-               WHERE made_by IS NOT NULL AND TRIM(made_by) != ''
-               GROUP BY made_by
-               ORDER BY last_seen DESC
-               LIMIT ?""", (limit,)
-        ).fetchall()
-        return [r["made_by"] for r in rows]
+        rows = session.query(
+            Voucher.made_by,
+            func.max(Voucher.id).label("last_seen")
+        ).filter(
+            Voucher.voucher_type == "PRODUCTION",
+            Voucher.made_by != None,
+            Voucher.made_by != ""
+        ).group_by(Voucher.made_by).order_by(
+            func.max(Voucher.id).desc()
+        ).limit(limit).all()
+        return [r[0] for r in rows]
     finally:
-        conn.close()
-
+        session.close()
 
 def production_consumption_detail(production_id: int):
+    """Retrieves material deductions for a specific Production Voucher."""
     conn = get_connection()
     try:
-        rows = conn.execute(
-            """SELECT pc.qty_consumed, m.code, m.name, m.unit
-               FROM production_consumption pc
-               JOIN materials m ON m.id = pc.material_id
-               WHERE pc.production_id = ?
-               ORDER BY m.name""", (production_id,)
-        ).fetchall()
+        sql = """
+            SELECT ABS(il.qty_change) AS qty_consumed, a.code, a.name, a.unit
+            FROM inventory_ledger il
+            JOIN articles a ON a.id = il.article_id
+            WHERE il.voucher_id = ? AND il.qty_change < 0
+            ORDER BY a.name
+        """
+        rows = conn.execute(sql, (production_id,)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()

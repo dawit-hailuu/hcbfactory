@@ -1,208 +1,261 @@
 """
-Inventory service: raw materials, stock movements, low-stock alerts.
-
-All stock changes go through `record_movement()` which:
-  1) appends a row to stock_movements (full audit history)
-  2) updates the cached current_stock on materials
-in a single transaction.
+Inventory service: raw materials, stock movements, and low-stock alerts.
+Bridged to the unified 'articles' table and double-entry ledger.
 """
-from app.database.db import get_connection
+from app.database.db import get_session, get_connection
+from app.database.models import Article, Voucher, InventoryLedger, JournalEntry
+from app.services import ledger_service
 from app.utils import clock
+from datetime import datetime
 
 
 def list_materials():
-    """All materials with current cached stock."""
-    conn = get_connection()
+    """All raw materials with cached stock."""
+    session = get_session()
     try:
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM materials ORDER BY name"
-        ).fetchall()]
+        materials = session.query(Article).filter(
+            Article.category == "RAW",
+            Article.is_active == True
+        ).order_by(Article.name).all()
+        return [
+            {
+                "id": m.id,
+                "code": m.code,
+                "name": m.name,
+                "unit": m.unit,
+                "current_stock": m.warehouse_qty,
+                "low_stock_alert": m.low_stock_alert,
+                "unit_cost": m.cost_price
+            } for m in materials
+        ]
     finally:
-        conn.close()
+        session.close()
 
 
 def get_material(material_id: int):
-    conn = get_connection()
+    session = get_session()
     try:
-        row = conn.execute("SELECT * FROM materials WHERE id = ?", (material_id,)).fetchone()
-        return dict(row) if row else None
+        m = session.query(Article).filter(
+            Article.id == material_id,
+            Article.category == "RAW"
+        ).first()
+        if m:
+            return {
+                "id": m.id,
+                "code": m.code,
+                "name": m.name,
+                "unit": m.unit,
+                "current_stock": m.warehouse_qty,
+                "low_stock_alert": m.low_stock_alert,
+                "unit_cost": m.cost_price
+            }
+        return None
     finally:
-        conn.close()
+        session.close()
 
 
 def record_movement(material_id: int, qty: float, movement: str,
                     user_id: int = None, reference: str = None, note: str = None,
-                    supplier_name: str = None, unit_cost: float = None,
-                    conn=None):
+                    session=None):
     """
-    Record a stock change.  qty is SIGNED:
-      - positive for purchase / addition
-      - negative for production consumption / adjustment down
-
-    If `conn` is provided, runs inside the caller's transaction (used by
-    production_service to keep production + consumption + stock atomic).
-    Purchases auto-receive an MV-#### voucher number.
+    Record a raw material stock change inside the double-entry ledger.
+    Grounded in ledger_service. Supports session share for atomic operations.
     """
-    if movement not in ("purchase", "production", "adjustment", "initial"):
+    if movement not in ("purchase", "production", "adjustment", "initial", "disposal"):
         raise ValueError(f"invalid movement type: {movement}")
 
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
+    own_session = session is None
+    if own_session:
+        session = get_session()
+        
     try:
-        voucher_no = None
-        if movement == "purchase":
-            from app.services import voucher_service
-            voucher_no = voucher_service.next_voucher("MV", conn=conn)
-
-        conn.execute(
-            """INSERT INTO stock_movements
-                 (material_id, qty, movement, reference, note, user_id,
-                  created_at, supplier_name, unit_cost, voucher_no)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (material_id, qty, movement, reference, note, user_id,
-             clock.now(), supplier_name, unit_cost, voucher_no),
+        # Resolve voucher type
+        v_type = "SRV" if movement == "purchase" else "ADJUSTMENT"
+        if movement == "production":
+            v_type = "PRODUCTION"
+        elif movement == "disposal":
+            v_type = "SIV"
+            
+        # 1. Create Voucher (if not inside an active parent transaction already)
+        v = ledger_service.create_voucher(
+            session=session,
+            voucher_type=v_type,
+            created_by_id=user_id or 1
         )
-        conn.execute(
-            "UPDATE materials SET current_stock = current_stock + ? WHERE id = ?",
-            (qty, material_id),
+        v.note = note
+        session.flush()
+        
+        # 2. Append Inventory Ledger
+        ledger_service.post_inventory_movement(
+            session=session,
+            voucher_id=v.id,
+            article_id=material_id,
+            qty_change=qty,
+            location="WAREHOUSE",
+            cost_rate=0.0
         )
-        if own_conn:
-            conn.commit()
+        
+        # 3. Balanced Journal Entry
+        art = session.query(Article).filter_by(id=material_id).first()
+        val = abs(qty) * (art.cost_price or 0.0)
+        account = "GL-1102 Raw Stock"
+        offset = "GL-2101 Accounts Payable" if v_type == "SRV" else "GL-5109 Stock Variance"
+        
+        if qty >= 0:
+            ledger_service.post_journal_entry(session, v.id, account, val, 0.0)
+            ledger_service.post_journal_entry(session, v.id, offset, 0.0, val)
+        else:
+            ledger_service.post_journal_entry(session, v.id, offset, val, 0.0)
+            ledger_service.post_journal_entry(session, v.id, account, 0.0, val)
+            
+        if own_session:
+            session.commit()
+    except Exception as e:
+        if own_session:
+            session.rollback()
+        raise e
     finally:
-        if own_conn:
-            conn.close()
+        if own_session:
+            session.close()
 
 
 def add_stock(material_id: int, qty: float, user_id: int = None,
-              note: str = None, unit_cost: float = None,
-              supplier_name: str = None):
-    """User-facing 'add stock' (purchase or initial stocking)."""
+              note: str = None, unit_cost: float = None):
+    """User-facing 'add stock' (purchase) posting an SRV Voucher."""
     if qty <= 0:
         raise ValueError("Quantity to add must be positive")
-    from app.services import audit_service
-    conn = get_connection()
+        
+    session = get_session()
     try:
-        record_movement(material_id, qty, "purchase",
-                        user_id=user_id, note=note,
-                        supplier_name=supplier_name, unit_cost=unit_cost,
-                        conn=conn)
+        art = session.query(Article).filter_by(id=material_id).first()
+        if not art:
+            raise ValueError("Material not found")
+            
+        # Update cost rate if provided
         if unit_cost is not None:
-            conn.execute("UPDATE materials SET unit_cost = ? WHERE id = ?",
-                         (unit_cost, material_id))
-        conn.commit()
-        # Get material name for audit
-        m = conn.execute("SELECT code FROM materials WHERE id = ?",
-                         (material_id,)).fetchone()
-        audit_service.log(
-            user_id, "stock_purchase",
-            f"material={m['code'] if m else material_id} qty=+{qty} "
-            f"unit_cost={unit_cost or '-'} supplier={supplier_name or '-'}"
-        )
+            art.cost_price = unit_cost
+            
+        record_movement(material_id, qty, "purchase",
+                        user_id=user_id, note=note, session=session)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        raise e
     finally:
-        conn.close()
+        session.close()
+
+
+def issue_stock(material_id: int, qty: float, user_id: int = None, note: str = None):
+    """User-facing 'issue stock' (disposal/waste) posting an SIV Voucher."""
+    if qty <= 0:
+        raise ValueError("Quantity to issue must be positive")
+        
+    session = get_session()
+    try:
+        art = session.query(Article).filter_by(id=material_id).first()
+        if not art:
+            raise ValueError("Material not found")
+            
+        if art.warehouse_qty < qty:
+            raise ValueError(f"Insufficient stock: have {art.warehouse_qty:.3f}, need {qty:.3f}")
+            
+        record_movement(material_id, -qty, "disposal",
+                        user_id=user_id, note=note or "Material issue/disposal", session=session)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
 
 
 def adjust_stock(material_id: int, new_qty: float, user_id: int = None, note: str = None):
-    """Set stock to an absolute value (e.g. after physical inventory count)."""
-    from app.services import audit_service
-    mat = get_material(material_id)
-    if mat is None:
-        raise ValueError("material not found")
-    delta = new_qty - mat["current_stock"]
-    if delta == 0:
-        return
-    record_movement(material_id, delta, "adjustment",
-                    user_id=user_id, note=note or "manual adjustment")
-    audit_service.log(
-        user_id, "stock_adjust",
-        f"material={mat['code']} from={mat['current_stock']} to={new_qty} "
-        f"delta={delta:+.3f} note={note or '-'}"
-    )
+    """Set raw material stock to physical count using a Stock Adjustment Voucher."""
+    session = get_session()
+    try:
+        art = session.query(Article).filter_by(id=material_id).first()
+        if not art:
+            raise ValueError("Material not found")
+            
+        delta = new_qty - (art.warehouse_qty or 0.0)
+        if delta == 0:
+            return
+            
+        record_movement(material_id, delta, "adjustment",
+                        user_id=user_id, note=note or "manual adjustment", session=session)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
 
 
-def stock_history(material_id: int = None, limit: int = 500):
+def stock_history(material_id: int = None, limit: int = 500, offset: int = 0):
+    """Retrieves physical movement history from the new inventory ledger."""
     conn = get_connection()
     try:
-        if material_id is None:
-            rows = conn.execute(
-                """SELECT sm.*, m.code AS material_code, m.name AS material_name, m.unit,
-                          u.username AS user_name
-                   FROM stock_movements sm
-                   JOIN materials m ON m.id = sm.material_id
-                   LEFT JOIN users u ON u.id = sm.user_id
-                   ORDER BY sm.id DESC LIMIT ?""", (limit,)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT sm.*, m.code AS material_code, m.name AS material_name, m.unit,
-                          u.username AS user_name
-                   FROM stock_movements sm
-                   JOIN materials m ON m.id = sm.material_id
-                   LEFT JOIN users u ON u.id = sm.user_id
-                   WHERE sm.material_id = ?
-                   ORDER BY sm.id DESC LIMIT ?""", (material_id, limit)
-            ).fetchall()
+        where = ["a.category = 'RAW'"]
+        params = []
+        if material_id is not None:
+            where.append("il.article_id = ?")
+            params.append(material_id)
+            
+        clause = "WHERE " + " AND ".join(where)
+        params.extend([limit, offset])
+        
+        sql = f"""
+            SELECT il.id, il.qty_change AS qty, il.location,
+                   v.voucher_type AS movement, v.voucher_no AS reference,
+                   v.created_at, u.username AS user_name,
+                   a.code AS material_code, a.name AS material_name, a.unit
+            FROM inventory_ledger il
+            JOIN vouchers v ON v.id = il.voucher_id
+            JOIN articles a ON a.id = il.article_id
+            LEFT JOIN users u ON u.id = v.created_by_id
+            {clause}
+            ORDER BY il.id DESC LIMIT ? OFFSET ?
+        """
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
 def low_stock_materials():
-    """Materials currently below or at their low-stock threshold."""
-    conn = get_connection()
+    """Raw materials below alert threshold."""
+    session = get_session()
     try:
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM materials WHERE current_stock <= low_stock_alert ORDER BY name"
-        ).fetchall()]
+        mats = session.query(Article).filter(
+            Article.category == "RAW",
+            Article.warehouse_qty <= Article.low_stock_alert,
+            Article.is_active == True
+        ).order_by(Article.name).all()
+        return [
+            {
+                "id": m.id,
+                "code": m.code,
+                "name": m.name,
+                "unit": m.unit,
+                "current_stock": m.warehouse_qty,
+                "low_stock_alert": m.low_stock_alert,
+                "unit_cost": m.cost_price
+            } for m in mats
+        ]
     finally:
-        conn.close()
+        session.close()
 
 
 def update_material_settings(material_id: int, low_stock_alert: float = None,
-                             unit_cost: float = None):
-    conn = get_connection()
+                              unit_cost: float = None):
+    session = get_session()
     try:
-        if low_stock_alert is not None:
-            conn.execute("UPDATE materials SET low_stock_alert = ? WHERE id = ?",
-                         (low_stock_alert, material_id))
-        if unit_cost is not None:
-            conn.execute("UPDATE materials SET unit_cost = ? WHERE id = ?",
-                         (unit_cost, material_id))
-        conn.commit()
+        art = session.query(Article).filter_by(id=material_id).first()
+        if art:
+            if low_stock_alert is not None:
+                art.low_stock_alert = low_stock_alert
+            if unit_cost is not None:
+                art.cost_price = unit_cost
+            session.commit()
     finally:
-        conn.close()
-
-
-def distinct_suppliers():
-    """Return distinct supplier names ever used in purchases, most recent first."""
-    conn = get_connection()
-    try:
-        rows = conn.execute(
-            """SELECT supplier_name, MAX(id) AS last_id
-                 FROM stock_movements
-                WHERE supplier_name IS NOT NULL AND TRIM(supplier_name) != ''
-             GROUP BY supplier_name
-             ORDER BY last_id DESC"""
-        ).fetchall()
-        return [r["supplier_name"] for r in rows]
-    finally:
-        conn.close()
-
-
-def supplier_purchase_history(supplier_name: str, limit: int = 200):
-    """All purchases from one supplier."""
-    conn = get_connection()
-    try:
-        rows = conn.execute(
-            """SELECT sm.*, m.code AS material_code, m.name AS material_name, m.unit
-                 FROM stock_movements sm
-                 JOIN materials m ON m.id = sm.material_id
-                WHERE sm.movement = 'purchase'
-                  AND LOWER(COALESCE(sm.supplier_name,'')) = LOWER(?)
-             ORDER BY sm.id DESC LIMIT ?""",
-            (supplier_name, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+        session.close()

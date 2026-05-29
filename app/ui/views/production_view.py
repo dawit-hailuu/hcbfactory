@@ -1,6 +1,6 @@
 """
-Production view: select product, enter quantity, see live consumption preview,
-confirm production run.  History tab shows past runs and the materials each used.
+Production view: select product, enter quantity, live consumption preview,
+and post Production Vouchers. History tab displays registered vouchers in a paginated log.
 """
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBo
                              QMessageBox, QTabWidget, QCompleter)
 
 from app.services import product_service, production_service
+from app.ui.widgets.paginated_table import PaginatedTableWidget
 
 
 class ProductionView(QWidget):
@@ -20,28 +21,24 @@ class ProductionView(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        try: self.refresh()
-        except Exception: pass
+        try: 
+            self.refresh()
+        except Exception: 
+            pass
 
     def _build(self):
         outer = QVBoxLayout(self); outer.setContentsMargins(20,20,20,20); outer.setSpacing(12)
 
-        head = QHBoxLayout()
-        t = QLabel("Production")
-        t.setObjectName("pagetitle")
-        head.addWidget(t); head.addStretch()
-        waste_btn = QPushButton("🗑 Record Waste / Damaged")
-        waste_btn.setObjectName("danger")
-        waste_btn.clicked.connect(self._record_waste)
-        head.addWidget(waste_btn)
-        outer.addLayout(head)
+        t = QLabel("Production Vouchers")
+        t.setStyleSheet("font-size: 22px; font-weight: bold; color: #1F4E79;")
+        outer.addWidget(t)
 
         self.tabs = QTabWidget()
 
-        # --- New production tab -----------------------------------------------
+        # --- New production tab ---
         new_tab = QWidget(); v = QVBoxLayout(new_tab)
 
-        gb = QGroupBox("Record Production")
+        gb = QGroupBox("Record Production Voucher")
         form = QFormLayout(gb)
 
         self.category = QComboBox()
@@ -60,20 +57,20 @@ class ProductionView(QWidget):
         qty_row = QHBoxLayout(); qty_row.addWidget(self.qty); qty_row.addWidget(self.qty_unit_lbl); qty_row.addStretch()
         form.addRow("Quantity:", qty_row)
 
-        # Made by — worker who physically made it (free-text, autocompletes from history)
+        # Made by — worker who physically molded the items
         self.made_by = QLineEdit()
         self.made_by.setPlaceholderText("Worker name (e.g. Abebe)")
         self._refresh_made_by_completer()
-        form.addRow("Made by:", self.made_by)
+        form.addRow("Made by (Operator):", self.made_by)
 
-        self.note = QLineEdit(); self.note.setPlaceholderText("Optional note")
+        self.note = QLineEdit(); self.note.setPlaceholderText("Optional batch notes")
         form.addRow("Note:", self.note)
 
         v.addWidget(gb)
 
         # Preview table
         prev_label = QLabel("Material Consumption (Preview)")
-        prev_label.setObjectName("subhead")
+        prev_label.setStyleSheet("font-weight: bold; color: #1F4E79; margin-top: 6px;")
         v.addWidget(prev_label)
 
         self.preview = QTableWidget(0, 6)
@@ -88,37 +85,33 @@ class ProductionView(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self.confirm_btn = QPushButton("✓ Confirm Production")
+        self.confirm_btn = QPushButton("✓ Post Production Voucher")
         self.confirm_btn.setObjectName("success")
         self.confirm_btn.clicked.connect(self._confirm)
         btn_row.addWidget(self.confirm_btn)
         v.addLayout(btn_row)
 
-        self.tabs.addTab(new_tab, "New Production")
+        self.tabs.addTab(new_tab, "New Production Voucher")
 
-        # --- History tab ------------------------------------------------------
+        # --- History tab ---
         hist_tab = QWidget(); vh = QVBoxLayout(hist_tab)
         from app.ui.widgets.search_box import SearchBox
-        self.search = SearchBox(None, placeholder="Search production by product, made-by, date, note…")
+        self.search = SearchBox(None, placeholder="Search production by voucher, product, made-by, note…")
         vh.addWidget(self.search)
 
-        self.history = QTableWidget(0, 8)
-        self.history.setHorizontalHeaderLabels(
-            ["Date", "Product", "Quantity", "Unit", "Made By", "User", "Note", "Actions"])
-        self.history.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.history.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
-        self.history.verticalHeader().setVisible(False)
-        self.history.setAlternatingRowColors(True)
-        self.history.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.search.attach(self.history)
+        self.history = PaginatedTableWidget(
+            ["Voucher No", "Date", "Product", "Quantity", "Unit", "Made By", "User", "Note"],
+            lambda limit, offset: production_service.list_production(limit=limit, offset=offset),
+            self._fill_history_table
+        )
+        self.search.attach(self.history.table)
         vh.addWidget(self.history)
-        self.tabs.addTab(hist_tab, "History")
+        self.tabs.addTab(hist_tab, "Voucher History")
 
         outer.addWidget(self.tabs)
         self._reload_products()
 
     def _refresh_made_by_completer(self):
-        """Rebuild the autocomplete word list from recent production entries."""
         names = production_service.recent_made_by(limit=10)
         completer = QCompleter(names, self.made_by)
         completer.setCaseSensitivity(Qt.CaseInsensitive)
@@ -149,16 +142,13 @@ class ProductionView(QWidget):
         q = self.qty.value()
         if pid is None or q <= 0:
             self.preview.setRowCount(0)
-            self._update_confirm_state(False)
             return
         try:
             rows = production_service.calculate_consumption(pid, q)
         except Exception:
             self.preview.setRowCount(0)
-            self._update_confirm_state(False)
             return
 
-        all_ok = bool(rows)
         self.preview.setRowCount(len(rows))
         for r, row in enumerate(rows):
             self.preview.setItem(r, 0, QTableWidgetItem(row["material_name"]))
@@ -170,20 +160,6 @@ class ProductionView(QWidget):
             status = QTableWidgetItem("✓ OK" if row["sufficient"] else "✗ SHORT")
             status.setForeground(Qt.darkGreen if row["sufficient"] else Qt.red)
             self.preview.setItem(r, 5, status)
-            if not row["sufficient"]:
-                all_ok = False
-        self._update_confirm_state(all_ok)
-
-    def _update_confirm_state(self, can_confirm: bool):
-        if not hasattr(self, "confirm_btn"): return
-        self.confirm_btn.setEnabled(can_confirm)
-        if can_confirm:
-            self.confirm_btn.setToolTip("")
-        else:
-            self.confirm_btn.setToolTip(
-                "Cannot confirm: pick a product, set quantity > 0, "
-                "and ensure all materials show ✓ OK."
-            )
 
     def _confirm(self):
         pid = self.product.currentData()
@@ -193,24 +169,19 @@ class ProductionView(QWidget):
             return
         made_by_val = self.made_by.text().strip() or None
         try:
-            new_id = production_service.record_production(
-                product_id=pid, quantity=q,
-                user_id=self.user["id"], note=self.note.text() or None,
+            production_service.record_production(
+                product_id=pid, 
+                quantity=q,
+                user_id=self.user["id"], 
+                note=self.note.text() or None,
                 made_by=made_by_val,
                 allow_negative_stock=False,
             )
-            # Look up voucher number for confirmation
-            rec = production_service.get_production(new_id)
-            vno = (rec or {}).get("voucher_no") or "-"
-            QMessageBox.information(
-                self, "Done",
-                f"Production recorded as {vno}.\nMaterials deducted and stock updated."
-            )
+            QMessageBox.information(self, "Done", "Production Voucher posted successfully.")
             self.qty.setValue(0); self.note.clear(); self.made_by.clear()
             self._refresh_made_by_completer()
             self.refresh()
         except ValueError as e:
-            # Insufficient materials etc.
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Warning)
             box.setWindowTitle("Cannot proceed")
@@ -221,67 +192,18 @@ class ProductionView(QWidget):
 
     def refresh(self):
         self._update_preview()
-        rows = production_service.list_production(limit=500)
-        self.history.setRowCount(len(rows))
-        for r, row in enumerate(rows):
-            self.history.setItem(r, 0, QTableWidgetItem(row["production_date"]))
-            self.history.setItem(r, 1, QTableWidgetItem(f"{row['product_code']} — {row['product_name']}"))
-            self.history.setItem(r, 2, QTableWidgetItem(f"{row['quantity']:.2f}"))
-            unit = "pieces" if row["input_unit"] == "piece" else "m²"
-            self.history.setItem(r, 3, QTableWidgetItem(unit))
-            self.history.setItem(r, 4, QTableWidgetItem(row.get("made_by") or ""))
-            self.history.setItem(r, 5, QTableWidgetItem(row.get("user_name") or ""))
-            self.history.setItem(r, 6, QTableWidgetItem(row.get("note") or ""))
-            # Actions column (admin only) — edit and delete
-            actions = QWidget(); ah = QHBoxLayout(actions); ah.setContentsMargins(0,0,0,0); ah.setSpacing(4)
-            if self.user["role"] == "admin":
-                eb = QPushButton("✎"); eb.setMaximumWidth(34); eb.setToolTip("Edit this production run")
-                eb.clicked.connect(lambda _, rid=row["id"]: self._edit_production(rid))
-                db = QPushButton("🗑"); db.setObjectName("danger"); db.setMaximumWidth(34)
-                db.setToolTip("Delete (reverses materials and stock)")
-                db.clicked.connect(lambda _, rid=row["id"]: self._delete_production(rid))
-                ah.addWidget(eb); ah.addWidget(db)
-            else:
-                ah.addStretch()  # blank for non-admins, no ugly "(admin)" text
-            self.history.setCellWidget(r, 7, actions)
+        self.history.refresh()
         if hasattr(self, "search"):
             self.search.reapply()
 
-    def _record_waste(self):
-        """Open waste dialog."""
-        from app.ui.views.dialogs.waste_dialog import WasteDialog
-        try:
-            dlg = WasteDialog(self.user, self)
-        except Exception as e:
-            QMessageBox.critical(self, "Cannot open", str(e)); return
-        if dlg.exec_() == dlg.Accepted:
-            self.refresh()
-
-    def _edit_production(self, prod_id):
-        from app.ui.views.dialogs.edit_production_dialog import EditProductionDialog
-        try:
-            dlg = EditProductionDialog(prod_id, self.user, self)
-        except ValueError as e:
-            QMessageBox.warning(self, "Not available", str(e)); return
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e)); return
-        if dlg.exec_() == dlg.Accepted:
-            self.refresh()
-
-    def _delete_production(self, prod_id):
-        from PyQt5.QtWidgets import QInputDialog
-        reason, ok = QInputDialog.getText(
-            self, "Delete production run",
-            "Reason for deletion (required):"
-        )
-        if not ok or not reason.strip():
-            return
-        from app.services import production_service
-        try:
-            production_service.delete_production(prod_id, user_id=self.user["id"],
-                                                  reason=reason.strip())
-            QMessageBox.information(self, "Deleted",
-                "Production run deleted. Materials returned to stock; finished stock reduced.")
-            self.refresh()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+    def _fill_history_table(self, table, data):
+        for r, row in enumerate(data):
+            table.setItem(r, 0, QTableWidgetItem(row.get("voucher_no") or ""))
+            table.setItem(r, 1, QTableWidgetItem(row["production_date"]))
+            table.setItem(r, 2, QTableWidgetItem(f"{row['product_code']} — {row['product_name']}"))
+            table.setItem(r, 3, QTableWidgetItem(f"{row['quantity']:.2f}"))
+            unit = "pieces" if row["input_unit"] == "piece" else "m²"
+            table.setItem(r, 4, QTableWidgetItem(unit))
+            table.setItem(r, 5, QTableWidgetItem(row.get("made_by") or ""))
+            table.setItem(r, 6, QTableWidgetItem(row.get("user_name") or ""))
+            table.setItem(r, 7, QTableWidgetItem(row.get("note") or ""))
